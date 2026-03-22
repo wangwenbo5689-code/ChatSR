@@ -1,0 +1,390 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>ChatPDF</title>
+  <script crossorigin src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+  <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+  <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+  <style>
+    :root { --bg:#f7f7f8; --panel:#f3f4f6; --card:#fff; --line:#e5e7eb; --text:#111827; --muted:#6b7280; }
+    * { box-sizing: border-box; }
+    body { margin:0; background:var(--bg); font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif; color:var(--text); }
+    .app { width:min(98vw, 1760px); margin:0 auto; height:100vh; display:flex; }
+
+    .sidebar { width:340px; border-right:1px solid var(--line); padding:16px 12px; display:flex; flex-direction:column; gap:10px; background:var(--panel); }
+    .btn { border:1px solid var(--line); background:#fff; border-radius:12px; padding:10px 12px; cursor:pointer; }
+    .btn.primary { font-weight:700; font-size:18px; padding:14px 16px; border-radius:14px; }
+    .btn.ghost { font-size:14px; color:#374151; }
+    .history { flex:1; overflow:auto; display:flex; flex-direction:column; gap:8px; }
+    .history-item { padding:12px 14px; border-radius:12px; cursor:pointer; background:transparent; border:1px solid transparent; }
+    .history-item:hover { background:#eceff3; }
+    .history-item.active { background:#e5e7eb; border-color:#d1d5db; }
+    .history-title { font-size:17px; font-weight:700; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+    .history-meta { font-size:14px; color:var(--muted); margin-top:4px; }
+    .history-actions { display:flex; gap:6px; margin-top:8px; }
+    .mini { font-size:12px; padding:4px 8px; border:1px solid #d1d5db; border-radius:8px; background:#fff; cursor:pointer; }
+
+    .main { flex:1; display:flex; flex-direction:column; min-width:0; }
+    .topbar { height:74px; border-bottom:1px solid var(--line); display:flex; align-items:center; justify-content:space-between; color:var(--muted); font-size:18px; padding:0 16px; }
+    .brand { font-weight:700; font-size:26px; color:var(--text); }
+
+    .chat { flex:1; overflow:auto; padding:30px 28px 18px; }
+    .msg-row { display:flex; margin:18px 0; }
+    .msg-row.user { justify-content:flex-end; }
+    .bubble { max-width:84%; border-radius:18px; padding:18px 22px; line-height:1.8; white-space:pre-wrap; font-size:20px; }
+    .bubble.user { background:#111827; color:#fff; }
+    .bubble.assistant { background:#fff; border:1px solid var(--line); }
+
+    .input-wrap { position:sticky; bottom:0; background:var(--bg); padding:18px 16px 24px; }
+    .input-card { background:#fff; border:1px solid var(--line); border-radius:22px; padding:14px; box-shadow:0 10px 28px rgba(0,0,0,.06); }
+    .row { display:flex; gap:14px; align-items:flex-end; }
+    .tool { width:56px; height:56px; border:1px solid var(--line); border-radius:14px; background:#fff; display:flex; align-items:center; justify-content:center; cursor:pointer; font-size:26px; }
+    textarea { flex:1; border:none; outline:none; resize:none; min-height:56px; max-height:260px; font-size:19px; line-height:1.7; font-family:inherit; background:transparent; }
+    .send { width:92px; height:56px; border:none; border-radius:14px; background:#111827; color:#fff; cursor:pointer; font-size:17px; font-weight:700; }
+    .status { margin-top:12px; font-size:16px; color:var(--muted); min-height:26px; }
+    .adv-toggle { margin-top:10px; font-size:13px; color:#374151; cursor:pointer; user-select:none; }
+    .adv-panel { margin-top:10px; border:1px solid var(--line); border-radius:12px; padding:10px; background:#fafafa; }
+    .adv-grid { display:grid; grid-template-columns: repeat(3, minmax(160px, 1fr)); gap:10px; }
+    .adv-item { display:flex; flex-direction:column; gap:6px; font-size:13px; color:#374151; }
+    .adv-item input { border:1px solid var(--line); border-radius:8px; padding:6px 8px; font-size:13px; }
+    .hidden { display:none; }
+    .empty { color:var(--muted); font-size:16px; padding:18px 4px; }
+  </style>
+</head>
+<body>
+  <div id="root"></div>
+
+  <script type="text/babel">
+    const { useEffect, useMemo, useRef, useState } = React;
+
+    async function api(url, opts = {}) {
+      const res = await fetch(url, opts);
+      if (!res.ok) {
+        let msg = `HTTP ${res.status}`;
+        try {
+          const data = await res.json();
+          msg = data.detail || data.message || msg;
+        } catch {}
+        throw new Error(msg);
+      }
+      const ct = res.headers.get('content-type') || '';
+      if (ct.includes('application/json')) return res.json();
+      return null;
+    }
+
+    function App() {
+      const [sessionList, setSessionList] = useState([]);
+      const [activeId, setActiveId] = useState('');
+      const [messages, setMessages] = useState([]);
+      const [input, setInput] = useState('');
+      const [status, setStatus] = useState('');
+      const [sending, setSending] = useState(false);
+      const [saveToLocalCorpus, setSaveToLocalCorpus] = useState(true);
+      const [showAdvanced, setShowAdvanced] = useState(false);
+      const [maxLength, setMaxLength] = useState(1024);
+      const [contextLen, setContextLen] = useState(8192);
+      const [temperature, setTemperature] = useState(0.7);
+      const fileRef = useRef(null);
+      const chatRef = useRef(null);
+
+      const activeSession = useMemo(
+        () => sessionList.find(s => s.id === activeId) || null,
+        [sessionList, activeId]
+      );
+
+      const loadSessions = async () => {
+        const data = await api('/api/sessions');
+        const sessions = data.sessions || [];
+        setSessionList(sessions);
+
+        const remembered = localStorage.getItem('chatpdf_active_session_id');
+        const exists = sessions.some(s => s.id === remembered);
+        const nextActive = exists ? remembered : (sessions[0]?.id || '');
+        setActiveId(nextActive);
+      };
+
+      const loadMessages = async (sessionId) => {
+        if (!sessionId) {
+          setMessages([]);
+          return;
+        }
+        const data = await api(`/api/sessions/${sessionId}`);
+        setMessages(data.messages || []);
+      };
+
+      useEffect(() => {
+        loadSessions().catch(e => setStatus('加载会话失败: ' + e.message));
+      }, []);
+
+      useEffect(() => {
+        if (!activeId) {
+          setMessages([]);
+          return;
+        }
+        localStorage.setItem('chatpdf_active_session_id', activeId);
+        loadMessages(activeId).catch(e => setStatus('加载消息失败: ' + e.message));
+      }, [activeId]);
+
+      useEffect(() => {
+        if (chatRef.current) chatRef.current.scrollTop = chatRef.current.scrollHeight;
+      }, [messages]);
+
+      const createSession = async () => {
+        try {
+          const data = await api('/api/sessions', { method: 'POST' });
+          await loadSessions();
+          setActiveId(data.id);
+        } catch (e) {
+          setStatus('新建会话失败: ' + e.message);
+        }
+      };
+
+      const renameSession = async (id) => {
+        const current = sessionList.find(s => s.id === id)?.title || '新对话';
+        const next = prompt('输入新的会话名称：', current);
+        if (!next || !next.trim()) return;
+        try {
+          const form = new FormData();
+          form.append('title', next.trim());
+          await api(`/api/sessions/${id}`, { method: 'PATCH', body: form });
+          await loadSessions();
+        } catch (e) {
+          setStatus('重命名失败: ' + e.message);
+        }
+      };
+
+      const removeSession = async (id) => {
+        if (!confirm('确定删除该会话？')) return;
+        try {
+          await api(`/api/sessions/${id}`, { method: 'DELETE' });
+          await loadSessions();
+          if (activeId === id) setActiveId('');
+        } catch (e) {
+          setStatus('删除失败: ' + e.message);
+        }
+      };
+
+      const clearAllSessions = async () => {
+        if (!confirm('确定清空全部历史会话？')) return;
+        try {
+          await api('/api/sessions', { method: 'DELETE' });
+          setSessionList([]);
+          setActiveId('');
+          setMessages([]);
+        } catch (e) {
+          setStatus('清空失败: ' + e.message);
+        }
+      };
+
+      const onUpload = async (files) => {
+        if (!files || files.length === 0) return;
+        const form = new FormData();
+        Array.from(files).forEach(f => form.append('files', f));
+        form.append('save_to_local_corpus', saveToLocalCorpus ? 'true' : 'false');
+        setStatus('上传中...');
+        try {
+          const data = await api('/api/upload', { method: 'POST', body: form });
+          setStatus(data.message || '上传完成');
+        } catch (e) {
+          setStatus('上传失败: ' + e.message);
+        }
+      };
+
+      const send = async () => {
+        const message = input.trim();
+        if (!message || sending) return;
+
+        const safeMaxLength = Math.max(64, Math.min(Number(maxLength) || 1024, 4096));
+        const safeContextLen = Math.max(1024, Math.min(Number(contextLen) || 8192, 200000));
+        const safeTemperature = Math.max(0, Math.min(Number(temperature) || 0.7, 2));
+
+        let sid = activeId;
+        if (!sid) {
+          try {
+            const data = await api('/api/sessions', { method: 'POST' });
+            sid = data.id;
+            setActiveId(sid);
+            await loadSessions();
+          } catch (e) {
+            setStatus('新建会话失败: ' + e.message);
+            return;
+          }
+        }
+
+        setInput('');
+        setSending(true);
+        setMessages(prev => [...prev, { role:'user', content: message }, { role:'assistant', content: '' }]);
+
+        const form = new FormData();
+        form.append('message', message);
+        form.append('session_id', sid);
+        form.append('max_length', String(safeMaxLength));
+        form.append('context_len', String(safeContextLen));
+        form.append('temperature', String(safeTemperature));
+
+        try {
+          const resp = await fetch('/api/chat/stream', { method:'POST', body:form });
+          if (!resp.ok) throw new Error('请求失败');
+
+          const reader = resp.body.getReader();
+          const decoder = new TextDecoder();
+          let buffer = '';
+
+          while (true) {
+            const { value, done } = await reader.read();
+            if (done) break;
+            buffer += decoder.decode(value, { stream: true });
+            const parts = buffer.split('\n\n');
+            buffer = parts.pop() || '';
+
+            for (const part of parts) {
+              if (!part.startsWith('data: ')) continue;
+              const raw = part.slice(6);
+              const evt = JSON.parse(raw);
+              if (evt.type === 'delta') {
+                setMessages(prev => {
+                  const next = [...prev];
+                  if (next.length) next[next.length - 1] = { role:'assistant', content: evt.content || '' };
+                  return next;
+                });
+              }
+              if (evt.type === 'error') setStatus('对话失败: ' + (evt.message || 'unknown'));
+            }
+          }
+
+          await loadSessions();
+        } catch (e) {
+          setStatus('请求失败: ' + e.message);
+        } finally {
+          setSending(false);
+        }
+      };
+
+      return (
+        <div className="app">
+          <aside className="sidebar">
+            <button className="btn primary" onClick={createSession}>+ 新对话</button>
+            <button className="btn ghost" onClick={clearAllSessions}>清空全部历史</button>
+
+            <div className="history">
+              {sessionList.length === 0 && <div className="empty">暂无历史会话</div>}
+              {sessionList.map(item => (
+                <div
+                  key={item.id}
+                  className={`history-item ${item.id === activeId ? 'active' : ''}`}
+                  onClick={() => setActiveId(item.id)}
+                >
+                  <div className="history-title">{item.title || '新对话'}</div>
+                  <div className="history-meta">{new Date(item.updated_at || 0).toLocaleString()}</div>
+                  <div className="history-actions" onClick={(e) => e.stopPropagation()}>
+                    <button className="mini" onClick={() => renameSession(item.id)}>重命名</button>
+                    <button className="mini" onClick={() => removeSession(item.id)}>删除</button>
+                  </div>
+                </div>
+              ))}
+            </div>
+          </aside>
+
+          <main className="main">
+            <div className="topbar">
+              <div className="brand">ChatPDF</div>
+              <div>{activeSession ? activeSession.title : 'FastAPI + React'}</div>
+            </div>
+
+            <div className="chat" ref={chatRef}>
+              {messages.map((m, idx) => (
+                <div key={idx} className={`msg-row ${m.role}`}>
+                  <div className={`bubble ${m.role}`}>{m.content}</div>
+                </div>
+              ))}
+            </div>
+
+            <div className="input-wrap">
+              <div className="input-card">
+                <div className="row">
+                  <button className="tool" onClick={() => fileRef.current.click()}>+</button>
+                  <input
+                    ref={fileRef}
+                    type="file"
+                    className="hidden"
+                    multiple
+                    accept=".pdf,.docx,.md,.txt,.jsonl"
+                    onChange={(e) => onUpload(e.target.files)}
+                  />
+                  <label style={{display:'flex',alignItems:'center',gap:'6px',fontSize:'14px',color:'#374151',whiteSpace:'nowrap'}}>
+                    <input
+                      type="checkbox"
+                      checked={saveToLocalCorpus}
+                      onChange={(e) => setSaveToLocalCorpus(e.target.checked)}
+                    />
+                    保存到本地语料库
+                  </label>
+                  <textarea
+                    value={input}
+                    placeholder="Message ChatPDF"
+                    onChange={(e) => setInput(e.target.value)}
+                    onKeyDown={(e) => {
+                      if (e.key === 'Enter' && !e.shiftKey) {
+                        e.preventDefault();
+                        send();
+                      }
+                    }}
+                  />
+                  <button className="send" onClick={send} disabled={sending}>发送</button>
+                </div>
+                <div className="adv-toggle" onClick={() => setShowAdvanced(v => !v)}>
+                  {showAdvanced ? '收起高级设置 ▲' : '展开高级设置 ▼'}
+                </div>
+                {showAdvanced && (
+                  <div className="adv-panel">
+                    <div className="adv-grid">
+                      <label className="adv-item">
+                        <span>max_length (64~4096)</span>
+                        <input
+                          type="number"
+                          min="64"
+                          max="4096"
+                          step="1"
+                          value={maxLength}
+                          onChange={(e) => setMaxLength(e.target.value)}
+                        />
+                      </label>
+                      <label className="adv-item">
+                        <span>context_len (1024~200000)</span>
+                        <input
+                          type="number"
+                          min="1024"
+                          max="200000"
+                          step="1"
+                          value={contextLen}
+                          onChange={(e) => setContextLen(e.target.value)}
+                        />
+                      </label>
+                      <label className="adv-item">
+                        <span>temperature (0~2)</span>
+                        <input
+                          type="number"
+                          min="0"
+                          max="2"
+                          step="0.1"
+                          value={temperature}
+                          onChange={(e) => setTemperature(e.target.value)}
+                        />
+                      </label>
+                    </div>
+                  </div>
+                )}
+                <div className="status">{status}</div>
+              </div>
+            </div>
+          </main>
+        </div>
+      );
+    }
+
+    ReactDOM.createRoot(document.getElementById('root')).render(<App />);
+  </script>
+</body>
+</html>
