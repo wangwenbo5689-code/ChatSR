@@ -110,6 +110,16 @@ ENV/
 env.bak/
 venv.bak/
 
+# Project runtime outputs
+corpus_embs/
+data/
+models/
+evaluation/
+*.db
+
+# Tool caches
+.ruff_cache/
+
 # Spyder project settings
 .spyderproject
 .spyproject
