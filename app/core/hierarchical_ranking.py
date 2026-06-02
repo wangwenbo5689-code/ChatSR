@@ -1,5 +1,6 @@
 from typing import Any, Dict, List, Optional
 
+from app.core.rag_defaults import DEFAULT_RERANK_MODEL_NAME, DEFAULT_TEXT_ENCODER_MAX_LENGTH
 from app.core.hierarchical_types import FusedResult, RetrievalResult
 
 logger: Any
@@ -109,7 +110,7 @@ class ResultReranker:
     """
     def __init__(
         self,
-        model_name_or_path: str = "BAAI/bge-reranker-base",
+        model_name_or_path: str = DEFAULT_RERANK_MODEL_NAME,
         device: str = "cpu",
         config: Optional[Dict[str, Any]] = None,
     ):
@@ -206,7 +207,13 @@ class ResultReranker:
 
             pairs = [[query, content] for content in contents]
             with torch.no_grad():
-                inputs = tokenizer(pairs, padding=True, truncation=True, return_tensors="pt", max_length=512)
+                inputs = tokenizer(
+                    pairs,
+                    padding=True,
+                    truncation=True,
+                    return_tensors="pt",
+                    max_length=DEFAULT_TEXT_ENCODER_MAX_LENGTH,
+                )
                 inputs_on_device = {key: value.to(model.device) for key, value in inputs.items()}
                 scores = model(**inputs_on_device, return_dict=True).logits.view(-1,).float()
             scores = scores.cpu().numpy()

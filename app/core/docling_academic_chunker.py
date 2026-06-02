@@ -11,7 +11,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from loguru import logger
 
-from app.core.rag_defaults import EMBEDDING_MODEL_NAME, EMBEDDING_MODEL_DIRNAME
+from app.core.rag_defaults import DEFAULT_CHUNK_OVERLAP, DEFAULT_CHUNK_SIZE, EMBEDDING_MODEL_NAME, EMBEDDING_MODEL_DIRNAME
 
 
 def load_hybrid_chunker():
@@ -62,8 +62,8 @@ class DoclingAcademicChunker:
 
         # 默认配置
         self.config = config or {
-            "max_tokens": 256,
-            "overlap_tokens": 50,
+            "max_tokens": DEFAULT_CHUNK_SIZE,
+            "overlap_tokens": DEFAULT_CHUNK_OVERLAP,
             "merge_peers": True,
             "inject_parent_headings": True,
             "tokenizer_model": EMBEDDING_MODEL_NAME,
@@ -78,8 +78,8 @@ class DoclingAcademicChunker:
 
         # 初始化混合分块器
         chunker_kwargs = {
-            "max_tokens": int(self.config.get("max_tokens", 256)),
-            "overlap_tokens": int(self.config.get("overlap_tokens", 50)),
+            "max_tokens": int(self.config.get("max_tokens", DEFAULT_CHUNK_SIZE)),
+            "overlap_tokens": int(self.config.get("overlap_tokens", DEFAULT_CHUNK_OVERLAP)),
             "merge_peers": bool(self.config.get("merge_peers", True)),
         }
         if tokenizer is not None:

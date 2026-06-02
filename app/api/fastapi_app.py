@@ -22,7 +22,7 @@ from loguru import logger
 # - routes: 5 个路由模块（chat, corpus, embedding, session, system）
 # - rag_runtime: RAG 运行时引导（模型加载）
 # ============================================================
-from app.api.app_config import build_runtime_config, parse_runtime_args, EMBEDDING_MODEL_NAME
+from app.api.app_config import build_runtime_config, parse_runtime_args
 from app.api.app_context import build_app_context
 from app.api.routes import (
     chat_router,
@@ -32,6 +32,7 @@ from app.api.routes import (
     system_router,
 )
 from app.core.rag_runtime import RagBootstrap
+from app.core.rag_defaults import DEFAULT_OLLAMA_HOST, EMBEDDING_MODEL_NAME
 
 
 def create_app(config=None):
@@ -67,7 +68,7 @@ def create_app(config=None):
         errors = []
 
         if model_kwargs.get("generate_model_type") == "ollama":
-            ollama_host = model_kwargs.get("ollama_host") or os.getenv("OLLAMA_HOST", "http://127.0.0.1:11434")
+            ollama_host = model_kwargs.get("ollama_host") or os.getenv("OLLAMA_HOST", DEFAULT_OLLAMA_HOST)
             try:
                 req = urllib.request.Request(f"{ollama_host.rstrip('/')}/api/tags", method="GET")
                 urllib.request.urlopen(req, timeout=5)

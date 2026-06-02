@@ -5,7 +5,7 @@ from typing import List, Any, Tuple
 
 import torch
 
-from app.core.rag_defaults import EMBEDDING_MODEL_NAME
+from app.core.rag_defaults import DEFAULT_TEXT_ENCODER_MAX_LENGTH, EMBEDDING_MODEL_NAME
 
 
 @lru_cache(maxsize=8)
@@ -35,7 +35,7 @@ class ProjectEmbeddingFunction:
         self,
         model_name_or_path: str = EMBEDDING_MODEL_NAME,
         device: str = "cpu",
-        max_length: int = 512,
+        max_length: int = DEFAULT_TEXT_ENCODER_MAX_LENGTH,
     ):
         """初始化嵌入函数
 

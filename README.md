@@ -93,9 +93,9 @@ uvicorn app.api.fastapi_app:app --host 0.0.0.0 --port 8000
 | `--gen_model_type` | `ollama` | 生成模型类型 |
 | `--gen_model_name` | `qwen2.5:3b` | Ollama 模型名称 |
 | `--ollama_host` | `http://127.0.0.1:11434` | Ollama 服务地址 |
-| `--rerank_model_name` | `BAAI/bge-reranker-base` | Rerank 模型名称 |
+| `--rerank_model_name` | `models/bge-reranker-base` | Rerank 模型名称或路径 |
 | `--chunk_size` | `256` | 分块大小 |
-| `--chunk_overlap` | `50` | 分块重叠 |
+| `--chunk_overlap` | `30` | 分块重叠 |
 | `--query_expansion` | `True` | 启用查询扩展 |
 | `--docling_use_ocr` | `True` | 启用 OCR |
 | `--docling_table_structure` | `True` | 启用表格结构提取 |

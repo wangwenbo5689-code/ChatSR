@@ -11,12 +11,26 @@ from loguru import logger
 
 from app.core.docling_extractor import create_docling_extractor
 from app.core.hierarchical_retriever import HierarchicalChromaRetriever
-from app.core.rag_defaults import EMBEDDING_MODEL_NAME, EMBEDDING_MODEL_DIRNAME
+from app.core.rag_defaults import (
+    DEFAULT_CHUNK_OVERLAP,
+    DEFAULT_CHUNK_SIZE,
+    DEFAULT_CONTEXT_LEN,
+    DEFAULT_GENERATE_MODEL_NAME,
+    DEFAULT_GENERATE_MODEL_TYPE,
+    DEFAULT_HISTORY_KEEP_TURNS,
+    DEFAULT_HISTORY_SUMMARY_TURNS,
+    DEFAULT_MAX_NEW_TOKENS,
+    DEFAULT_OLLAMA_HOST,
+    DEFAULT_PARENT_RERANK_TOP_K,
+    DEFAULT_RERANK_MODEL_NAME,
+    DEFAULT_SUMMARY_MAX_NEW_TOKENS,
+    DEFAULT_TEMPERATURE,
+    EMBEDDING_MODEL_NAME,
+    EMBEDDING_MODEL_DIRNAME,
+)
 from app.core.rag_common import (
     ACADEMIC_TOKENIZER_MODEL_NAME, ACADEMIC_TOKENIZER_LOCAL_DIRNAME,
-    DEFAULT_GENERATION_LIMITS, DEFAULT_RERANK_MODEL_NAME,
-    DEFAULT_RETRIEVAL_STRATEGY, _merge_generation_limits,
-    _merge_retrieval_strategy, add_source_numbers, make_chunk_item,
+    _merge_generation_limits, _merge_retrieval_strategy, add_source_numbers, make_chunk_item,
 )
 from app.core.rag_generation_model import init_generation_model, resolve_default_device
 from app.core.rag_history_manager import RagHistoryManager
@@ -30,25 +44,26 @@ from app.services.rag_ingestion_service import RagIngestionService
 from app.services.rag_persistence_service import RagPersistenceService
 from app.services.rag_retrieval_service import RagRetrievalService
 
-
 class Rag:
     def __init__(
             self,
-            generate_model_type: str = "ollama",
-            generate_model_name_or_path: str = "qwen2.5:3b",
+            generate_model_type: str = DEFAULT_GENERATE_MODEL_TYPE,
+            generate_model_name_or_path: str = DEFAULT_GENERATE_MODEL_NAME,
             lora_model_name_or_path: Optional[str] = None,
             corpus_files: Optional[Union[str, List[str]]] = None,
             save_corpus_emb_dir: str = "./corpus_embs/",
             device: Optional[str] = None,
             int8: bool = False,
             int4: bool = False,
-            chunk_size: int = 256,
-            chunk_overlap: int = 50,
+            chunk_size: int = DEFAULT_CHUNK_SIZE,
+            chunk_overlap: int = DEFAULT_CHUNK_OVERLAP,
             rerank_model_name_or_path: Optional[str] = None,
             enable_history: bool = True,
-            rerank_top_k: int = 3,
-            ollama_host: Optional[str] = None,
+            rerank_top_k: int = DEFAULT_PARENT_RERANK_TOP_K,
+            ollama_host: Optional[str] = DEFAULT_OLLAMA_HOST,
             history_summary: str = "",
+            history_summary_turns: int = DEFAULT_HISTORY_SUMMARY_TURNS,
+            history_keep_last_turns: int = DEFAULT_HISTORY_KEEP_TURNS,
             docling_use_ocr: bool = True,
             docling_table_structure: bool = True,
             query_expansion: bool = True,
@@ -60,19 +75,19 @@ class Rag:
 
         Args:
             generate_model_type: 生成模型类型，默认为 "ollama"
-            generate_model_name_or_path: 生成模型名称或路径，默认为 "qwen2.5:3b"（Ollama）
+            generate_model_name_or_path: 生成模型名称或路径，默认值来自 rag_defaults.py
             lora_model_name_or_path: LoRA 模型名称或路径
             corpus_files: 语料文件
             save_corpus_emb_dir: 保存语料嵌入的目录，默认为 ./corpus_embs/
             device: 设备，默认为 None，自动选择 GPU 或 CPU
             int8: 是否使用 int8 量化，默认为 False
             int4: 是否使用 int4 量化，默认为 False
-            chunk_size: 分块大小，默认为 256
-            chunk_overlap: 分块重叠，默认为 50
-            rerank_model_name_or_path: 重排模型名称或路径，默认为 'BAAI/bge-reranker-base'
+            chunk_size: 分块大小，默认值来自 rag_defaults.py
+            chunk_overlap: 分块重叠，默认值来自 rag_defaults.py
+            rerank_model_name_or_path: 重排模型名称或路径，默认为本地 models/bge-reranker-base
             enable_history: 是否启用历史记录，默认为 True
             rerank_top_k: 层次检索和重排后保留的 top-k 参考
-            ollama_host: Ollama 主机地址，默认为 "http://127.0.0.1:11434"
+            ollama_host: Ollama 主机地址，默认值来自 rag_defaults.py
             history_summary: 当前会话的压缩记忆
             docling_use_ocr: 是否在 Docling 提取器中启用 OCR
             docling_table_structure: 是否启用 Docling 表格结构提取（TableFormer）
@@ -100,6 +115,7 @@ class Rag:
         )
         self._init_config(
             enable_history, rerank_top_k, history_summary,
+            history_summary_turns, history_keep_last_turns,
             query_expansion, generation_limits, retrieval_strategy,
         )
         self._init_services()
@@ -139,7 +155,7 @@ class Rag:
         self.tokenizer: Any = None
 
         if self.use_ollama:
-            self.ollama_host = ollama_host or os.getenv("OLLAMA_HOST", "http://127.0.0.1:11434")
+            self.ollama_host = ollama_host or os.getenv("OLLAMA_HOST", DEFAULT_OLLAMA_HOST)
             self.ollama_model = gen_model_name_or_path
             logger.info(f"Using Ollama model: {self.ollama_model} at {self.ollama_host}")
         else:
@@ -149,8 +165,16 @@ class Rag:
             )
 
     def _init_services(self):
-        self.history_manager = RagHistoryManager(self.stream_generate_answer)
-        self.query_expander = RagQueryExpander(self._generate_summary)
+        self.history_manager = RagHistoryManager(
+            self.stream_generate_answer,
+            summary_turns=self.history_summary_turns,
+            keep_turns=self.history_keep_last_turns,
+        )
+        self.query_expander = RagQueryExpander(
+            self._generate_summary,
+            history_summary_turns=self.history_summary_turns,
+            history_keep_turns=self.history_keep_last_turns,
+        )
         self._index_service = RagIndexService(self)
         self._document_service = RagDocumentService(self)
         self._ingestion_service = RagIngestionService(self)
@@ -158,11 +182,25 @@ class Rag:
         self._generation_service = RagGenerationService(self)
         self._persistence_service = RagPersistenceService(self)
 
-    def _init_config(self, enable_history, rerank_top_k, history_summary, query_expansion, generation_limits, retrieval_strategy):
+    def _init_config(
+        self,
+        enable_history,
+        rerank_top_k,
+        history_summary,
+        history_summary_turns,
+        history_keep_last_turns,
+        query_expansion,
+        generation_limits,
+        retrieval_strategy,
+    ):
         self.history: List[List[str]] = []
         self.enable_history = enable_history
         self.rerank_top_k = rerank_top_k
         self.history_summary = history_summary or ""
+        resolved_summary_turns = DEFAULT_HISTORY_SUMMARY_TURNS if history_summary_turns is None else history_summary_turns
+        resolved_keep_turns = DEFAULT_HISTORY_KEEP_TURNS if history_keep_last_turns is None else history_keep_last_turns
+        self.history_summary_turns = max(int(resolved_summary_turns), 0)
+        self.history_keep_last_turns = max(int(resolved_keep_turns), 0)
         self.query_expansion = query_expansion
         self.generation_limits = _merge_generation_limits(generation_limits)
         self.retrieval_strategy = _merge_retrieval_strategy(retrieval_strategy)
@@ -269,8 +307,8 @@ class Rag:
     def _generate_summary(
             self,
             prompt: str,
-            max_new_tokens: int = 256,
-            temperature: float = 0.2,
+            max_new_tokens: int = DEFAULT_SUMMARY_MAX_NEW_TOKENS,
+            temperature: float = DEFAULT_TEMPERATURE,
     ) -> str:
         """生成摘要
 
@@ -309,10 +347,10 @@ class Rag:
     @torch.inference_mode()
     def stream_generate_answer(
             self,
-            max_new_tokens=1024,
-            temperature=0.7,
+            max_new_tokens=DEFAULT_MAX_NEW_TOKENS,
+            temperature=DEFAULT_TEMPERATURE,
             repetition_penalty=1.0,
-            context_len=2048,
+            context_len=DEFAULT_CONTEXT_LEN,
             history=None,
             history_summary=None,
     ):
@@ -367,9 +405,9 @@ class Rag:
     def predict_stream(
             self,
             query: str,
-            max_length: int = 768,
-            context_len: int = 8192,
-            temperature: float = 0.2,
+            max_length: int = DEFAULT_MAX_NEW_TOKENS,
+            context_len: int = DEFAULT_CONTEXT_LEN,
+            temperature: float = DEFAULT_TEMPERATURE,
             history=None,
             history_summary=None,
             selected_doc_paths=None,

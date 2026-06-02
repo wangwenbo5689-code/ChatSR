@@ -19,8 +19,16 @@ from app.core.hierarchical_context_builder import ContextBuilder
 from app.core.hierarchical_payload_builder import build_hierarchical_document_payloads
 from app.core.hierarchical_ranking import ResultFuser, ResultReranker
 from app.core.hierarchical_types import FusedResult, RetrievalLevel, RetrievalResult
-from app.core.rag_defaults import default_hierarchical_retriever_config
-from app.core.section_filters import is_noise_section_metadata, is_noise_section_title
+from app.core.rag_defaults import (
+    DEFAULT_ELEMENT_CANDIDATE_POOL_SIZE,
+    DEFAULT_ELEMENT_RETRIEVER_TOP_K,
+    DEFAULT_HYBRID_RETRIEVE_TOP_N,
+    DEFAULT_PARENT_RERANK_TOP_K,
+    DEFAULT_PAPER_RETRIEVER_TOP_K,
+    DEFAULT_RERANK_MODEL_NAME,
+    default_hierarchical_retriever_config,
+)
+from app.core.section_filters import is_method_section_metadata, is_noise_section_metadata, is_noise_section_title
 
 
 # 推荐配置（仅保留当前代码路径实际生效的参数）
@@ -47,7 +55,7 @@ class HybridRetriever:
         persist_directory: str,
         embedding_model_name_or_path: str,
         device: str = "cpu",
-        rerank_model_name_or_path: str = "BAAI/bge-reranker-base",
+        rerank_model_name_or_path: str = DEFAULT_RERANK_MODEL_NAME,
         config: Optional[Dict[str, Any]] = None
     ):
         import chromadb
@@ -88,6 +96,26 @@ class HybridRetriever:
             config=self.config
         ) if self.config.get("enable_rerank", True) else None
         self.refresh_indexes()
+
+    def _config_value(self, key: str, default: Any = None) -> Any:
+        config = getattr(self, "config", {}) or {}
+        if key in config:
+            return config[key]
+        if key in RECOMMENDED_CONFIG:
+            return RECOMMENDED_CONFIG[key]
+        return default
+
+    def _config_int(self, key: str, default: int) -> int:
+        try:
+            return int(self._config_value(key, default))
+        except (TypeError, ValueError):
+            return int(default)
+
+    def _config_float(self, key: str, default: float) -> float:
+        try:
+            return float(self._config_value(key, default))
+        except (TypeError, ValueError):
+            return float(default)
 
     def upsert_collection(self, collection, ids: List[str], documents: List[str], metadatas: List[Dict[str, Any]]):
         collection.upsert(
@@ -310,6 +338,21 @@ class HybridRetriever:
         ]
         return self._truncate_text("\n".join(element_texts), limit)
 
+    def _section_full_text(
+        self,
+        section_record: Dict[str, Any],
+        elements_by_section: Dict[str, List[Dict[str, Any]]],
+    ) -> str:
+        section_id = str((section_record.get("metadata") or {}).get("section_id") or section_record.get("id") or "").strip()
+        element_texts = [
+            str(element.get("document") or "").strip()
+            for element in self._sort_element_records(elements_by_section.get(section_id, []))
+            if str(element.get("document") or "").strip()
+        ]
+        if element_texts:
+            return "\n".join(element_texts)
+        return str(section_record.get("document") or "").strip()
+
     def _render_document_overview_packet(
         self,
         paper_record: Dict[str, Any],
@@ -345,27 +388,24 @@ class HybridRetriever:
             page_text = f"第{start_page}页" if start_page == end_page else f"第{start_page}-{end_page}页"
             structure_lines.append(f"{index}. {title_text}（{page_text}，{meta.get('chunk_count', 0)}块）")
 
-        representative_lines = ["", "【各章节代表内容】"]
+        section_content_lines = ["", "【各章节全部内容】"]
         for index, section in enumerate(section_records, start=1):
             meta = dict(section.get("metadata") or {})
             title_text = str(meta.get("section_hierarchy") or meta.get("section_title") or section.get("id") or "").strip()
             start_page = meta.get("start_page", "?")
             end_page = meta.get("end_page", start_page)
             page_text = f"第{start_page}页" if start_page == end_page else f"第{start_page}-{end_page}页"
-            representative = self._section_representative_text(section, elements_by_section)
-            if not representative:
+            section_text = self._section_full_text(section, elements_by_section)
+            if not section_text:
                 continue
-            representative_lines.extend([
+            section_content_lines.extend([
                 "",
                 f"### {index}. {title_text}",
                 f"页码: {page_text}",
-                representative,
+                section_text,
             ])
 
-        body = "\n".join(header_lines + structure_lines + representative_lines).strip()
-        if len(paper_doc) <= 8000 and paper_doc:
-            body += "\n\n【全文内容】\n" + paper_doc
-        return self._truncate_text(body, 24000)
+        return "\n".join(header_lines + structure_lines + section_content_lines).strip()
 
     def build_document_overview_context(self, doc_hash: str, query: str = "") -> Dict[str, Any]:
         normalized_hash = str(doc_hash or "").strip().lower()
@@ -375,24 +415,31 @@ class HybridRetriever:
         paper_records = self._collection_records_by_doc_hash(self.paper_collection, normalized_hash)
         if not paper_records:
             payload = self._empty_response()
-            payload["context"] = "未找到选中文档的层级索引内容。"
+            payload["context"] = "未找到选中文档的层级索引内容"
             return payload
         paper_record = paper_records[0]
 
         section_records = [
             record for record in self._collection_records_by_doc_hash(self.section_collection, normalized_hash)
-            if not is_noise_section_metadata(record.get("metadata"))
+            if (
+                not is_noise_section_metadata(record.get("metadata"))
+                and not is_method_section_metadata(record.get("metadata"))
+            )
         ]
         section_records = self._sort_section_records(section_records)
+        allowed_section_ids = {
+            str((record.get("metadata") or {}).get("section_id") or record.get("id") or "").strip()
+            for record in section_records
+        }
+        allowed_section_ids = {section_id for section_id in allowed_section_ids if section_id}
 
         element_records = [
             record for record in self._collection_records_by_doc_hash(self.element_collection, normalized_hash)
-            if not is_noise_section_metadata(record.get("metadata"))
         ]
         elements_by_section: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
         for element in element_records:
             section_id = str((element.get("metadata") or {}).get("section_id") or "").strip()
-            if section_id:
+            if section_id in allowed_section_ids:
                 elements_by_section[section_id].append(element)
 
         block = self._render_document_overview_packet(
@@ -455,10 +502,11 @@ class HybridRetriever:
         if resolved_intent not in {"document_overview", "general_overview", "fact_qa"}:
             raise ValueError("意图分类失败：未提供有效intent")
         dense_weight, sparse_weight = self._fusion_weights_for_intent(resolved_intent, RetrievalLevel.ELEMENT.value)
+        recall_depth = max(self._config_int("element_base_recall", DEFAULT_ELEMENT_CANDIDATE_POOL_SIZE), int(topn))
         element_dense, element_sparse = self._retrieve_with_optional_doc_filter(
             self.element_retriever,
             query,
-            topn=int(max(int(self.config.get("element_base_recall", 15) or 15) * 3, int(topn) * 3)),
+            topn=recall_depth * 3,
             allowed_doc_hashes=allowed_doc_hashes,
         )
         child_hits = self.result_fuser._rrf_fuse(
@@ -570,7 +618,7 @@ class HybridRetriever:
         fused_results.sort(key=lambda item: item.fused_score, reverse=True)
 
         # 2) 父块初筛：保留 >= 最大融合分数 * 0.7
-        before_ratio = float(self.config.get("parent_prescreen_threshold", 0.7))
+        before_ratio = self._config_float("parent_prescreen_threshold", RECOMMENDED_CONFIG["parent_prescreen_threshold"])
         max_parent_score = max(item.fused_score for item in fused_results)
         prefiltered_parents = [
             item for item in fused_results
@@ -588,9 +636,9 @@ class HybridRetriever:
         if not reranked_parents:
             return []
         if resolved_intent == "general_overview":
-            after_ratio = float(self.config.get("parent_rerank_threshold_overview", 0.78))
+            after_ratio = self._config_float("parent_rerank_threshold_overview", 0.78)
         elif resolved_intent == "fact_qa":
-            after_ratio = float(self.config.get("parent_rerank_threshold", 0.7))
+            after_ratio = self._config_float("parent_rerank_threshold", 0.7)
         top_rerank_score = max(item.fused_score for item in reranked_parents)
         final_parents = [
             item for item in reranked_parents
@@ -605,10 +653,11 @@ class HybridRetriever:
         allowed_doc_hashes: Optional[set[str]] = None,
     ) -> List[FusedResult]:
         dense_weight, sparse_weight = self._fusion_weights_for_intent("fact_qa", RetrievalLevel.ELEMENT.value)
+        recall_depth = max(self._config_int("element_base_recall", DEFAULT_ELEMENT_CANDIDATE_POOL_SIZE), int(topn))
         element_dense, element_sparse = self._retrieve_with_optional_doc_filter(
             self.element_retriever,
             query,
-            topn=int(max(int(self.config.get("element_base_recall", 15) or 15) * 3, int(topn) * 3)),
+            topn=recall_depth * 3,
             allowed_doc_hashes=allowed_doc_hashes,
         )
         child_hits = self.result_fuser._rrf_fuse(
@@ -653,19 +702,19 @@ class HybridRetriever:
                     query=query,
                     results=child_candidates,
                     top_k=None,
-                    original_score_weight=float(self.config.get("fact_original_weight", 0.5)),
-                    rerank_score_weight=float(self.config.get("fact_rerank_weight", 0.5)),
+                    original_score_weight=self._config_float("fact_original_weight", 0.5),
+                    rerank_score_weight=self._config_float("fact_rerank_weight", 0.5),
                 )
             except Exception as exc:
                 logger.warning(f"子块重排失败，使用融合排序: {exc}")
         child_candidates = sorted(child_candidates, key=lambda item: float(item.fused_score), reverse=True)
         if not child_candidates:
             return []
-        rank_keep_ratio = float(self.config.get("child_rank_percentile_keep", 0.4))
+        rank_keep_ratio = self._config_float("child_rank_percentile_keep", RECOMMENDED_CONFIG["child_rank_percentile_keep"])
         rank_keep_ratio = min(max(rank_keep_ratio, 0.05), 1.0)
         rank_keep_count = max(1, int(math.ceil(len(child_candidates) * rank_keep_ratio)))
         child_candidates = child_candidates[:rank_keep_count]
-        keep_ratio = float(self.config.get("child_rerank_threshold", 0.7))
+        keep_ratio = self._config_float("child_rerank_threshold", 0.7)
         top_score = float(child_candidates[0].fused_score)
         filtered = [item for item in child_candidates if float(item.fused_score) >= top_score * keep_ratio]
         return filtered or child_candidates[:1]
@@ -673,7 +722,7 @@ class HybridRetriever:
     def _filter_children_by_rank_percent(self, child_hits: List[RetrievalResult]) -> List[RetrievalResult]:
         if not child_hits:
             return []
-        keep_ratio = float(self.config.get("child_rank_percentile_keep", 0.4))
+        keep_ratio = self._config_float("child_rank_percentile_keep", RECOMMENDED_CONFIG["child_rank_percentile_keep"])
         keep_ratio = min(max(keep_ratio, 0.05), 1.0)
         ranked = sorted(child_hits, key=lambda item: item.score, reverse=True)
         keep_count = max(1, int(math.ceil(len(ranked) * keep_ratio)))
@@ -731,14 +780,14 @@ class HybridRetriever:
         child_scores = [max(float(child.score), 0.0) for child in children]
         best_child_score = max(child_scores)
         avg_child_score = sum(child_scores) / len(child_scores)
-        support_weight = float(config.get("support_bonus_weight", 0.3))
-        count_weight = float(config.get("child_count_bonus_weight", 0.15))
+        support_weight = self._config_float("support_bonus_weight", 0.3)
+        count_weight = self._config_float("child_count_bonus_weight", 0.15)
         if resolved_intent == "fact_qa":
-            support_weight = float(config.get("support_bonus_weight_fact", support_weight))
-            count_weight = float(config.get("child_count_bonus_weight_fact", count_weight))
+            support_weight = self._config_float("support_bonus_weight_fact", support_weight)
+            count_weight = self._config_float("child_count_bonus_weight_fact", count_weight)
         elif resolved_intent == "general_overview":
-            support_weight = float(config.get("support_bonus_weight_overview", support_weight))
-            count_weight = float(config.get("child_count_bonus_weight_overview", count_weight))
+            support_weight = self._config_float("support_bonus_weight_overview", support_weight)
+            count_weight = self._config_float("child_count_bonus_weight_overview", count_weight)
         support_bonus = support_weight * avg_child_score
         count_bonus = count_weight * max(len(child_scores) - 1, 0)
         parent_score = best_child_score + support_bonus + count_bonus
@@ -770,11 +819,11 @@ class HybridRetriever:
         config = getattr(self, "config", {}) or {}
         resolved_intent = (intent or "").strip().lower() if isinstance(intent, str) else ""
         if resolved_intent == "fact_qa":
-            original_weight = float(config.get("fact_original_weight", 0.5))
-            model_weight = float(config.get("fact_rerank_weight", 0.5))
+            original_weight = self._config_float("fact_original_weight", 0.5)
+            model_weight = self._config_float("fact_rerank_weight", 0.5)
         else:
-            original_weight = float(config.get("overview_original_weight", 0.3))
-            model_weight = float(config.get("overview_rerank_weight", 0.7))
+            original_weight = self._config_float("overview_original_weight", 0.3)
+            model_weight = self._config_float("overview_rerank_weight", 0.7)
         try:
             reranked = self._call_reranker(
                 query=query,
@@ -844,13 +893,13 @@ class HybridRetriever:
             allowed_doc_hashes=allowed_doc_hashes,
         )
 
-    def retrieve(self, query: str, topn: int = 8, allowed_doc_hashes: Optional[set[str]] = None, intent: Optional[str] = None) -> Dict[str, Any]:
+    def retrieve(self, query: str, topn: int = DEFAULT_HYBRID_RETRIEVE_TOP_N, allowed_doc_hashes: Optional[set[str]] = None, intent: Optional[str] = None) -> Dict[str, Any]:
         """统一检索入口。
 
         topn 语义：召回阶段的候选深度；最终输出数量由 parent_rerank_top_k 控制。
         """
         allowed_doc_hashes = self._normalize_allowed_doc_hashes(allowed_doc_hashes)
-        parent_rerank_top_k = int(max(int(self.config.get("parent_rerank_top_k", 5) or 5), 1))
+        parent_rerank_top_k = max(self._config_int("parent_rerank_top_k", DEFAULT_PARENT_RERANK_TOP_K), 1)
         resolved_intent = self._normalize_intent(intent)
         if resolved_intent not in {"document_overview", "general_overview", "fact_qa"}:
             raise ValueError("意图分类失败：未提供有效intent")
@@ -872,9 +921,9 @@ class HybridRetriever:
             )
             if child_candidates:
                 child_candidates = sorted(child_candidates, key=lambda item: float(item.fused_score), reverse=True)
-                keep_ratio = float(self.config.get("dynamic_score_threshold", 0.7))
-                min_keep = int(self.config.get("dynamic_min_keep_fact", 1))
-                max_keep = int(self.config.get("dynamic_max_keep_fact", 6))
+                keep_ratio = self._config_float("dynamic_score_threshold", 0.7)
+                min_keep = self._config_int("dynamic_min_keep_fact", 1)
+                max_keep = self._config_int("dynamic_max_keep_fact", 6)
                 top_score = float(child_candidates[0].fused_score)
                 selected = [item for item in child_candidates if float(item.fused_score) >= top_score * keep_ratio]
                 if len(selected) < min_keep:
@@ -904,7 +953,7 @@ class BaseCollectionRetriever:
 
     level = ""
     collection_label = ""
-    default_top_k = 10
+    default_top_k = DEFAULT_PAPER_RETRIEVER_TOP_K
 
     def __init__(self, collection, embedding_fn, enable_sparse: bool = True, persist_directory: Optional[str] = None, tokenizer: Any = None):
         self.collection = collection
@@ -1141,7 +1190,7 @@ class PaperRetriever(BaseCollectionRetriever):
 
     level = RetrievalLevel.PAPER.value
     collection_label = "paper"
-    default_top_k = 10
+    default_top_k = DEFAULT_PAPER_RETRIEVER_TOP_K
 
     def __init__(self, collection, embedding_fn, persist_directory: Optional[str] = None, tokenizer: Any = None):
         super().__init__(collection, embedding_fn, enable_sparse=False, persist_directory=persist_directory, tokenizer=tokenizer)
@@ -1152,7 +1201,7 @@ class ElementRetriever(BaseCollectionRetriever):
 
     level = RetrievalLevel.ELEMENT.value
     collection_label = "element"
-    default_top_k = 20
+    default_top_k = DEFAULT_ELEMENT_RETRIEVER_TOP_K
 
     def __init__(self, collection, embedding_fn, persist_directory: Optional[str] = None, tokenizer: Any = None):
         super().__init__(collection, embedding_fn, enable_sparse=True, persist_directory=persist_directory, tokenizer=tokenizer)
@@ -1166,7 +1215,7 @@ class HierarchicalChromaRetriever:
         persist_directory: str,
         embedding_model_name_or_path: str,
         device: str = "cpu",
-        rerank_model_name_or_path: str = "BAAI/bge-reranker-base",
+        rerank_model_name_or_path: str = DEFAULT_RERANK_MODEL_NAME,
     ):
         self.persist_directory = persist_directory
         self.embedding_model_name_or_path = embedding_model_name_or_path
@@ -1276,7 +1325,7 @@ class HierarchicalChromaRetriever:
             )
         self.refresh_indexes()
 
-    def retrieve(self, query: str, topn: int = 8, allowed_doc_hashes: Optional[set[str]] = None, intent: Optional[str] = None) -> Dict[str, Any]:
+    def retrieve(self, query: str, topn: int = DEFAULT_HYBRID_RETRIEVE_TOP_N, allowed_doc_hashes: Optional[set[str]] = None, intent: Optional[str] = None) -> Dict[str, Any]:
         return self.retriever.retrieve(query, topn, allowed_doc_hashes=allowed_doc_hashes, intent=intent)
 
     def build_document_overview_context(self, doc_hash: str, query: str = "") -> Dict[str, Any]:
@@ -1285,7 +1334,7 @@ class HierarchicalChromaRetriever:
     def retrieve_parent_candidates(
         self,
         query: str,
-        topn: int = 8,
+        topn: int = DEFAULT_HYBRID_RETRIEVE_TOP_N,
         allowed_doc_hashes: Optional[set[str]] = None,
         intent: Optional[str] = None,
     ) -> List[FusedResult]:
@@ -1300,7 +1349,7 @@ class HierarchicalChromaRetriever:
     def retrieve_child_candidates(
         self,
         query: str,
-        topn: int = 8,
+        topn: int = DEFAULT_HYBRID_RETRIEVE_TOP_N,
         allowed_doc_hashes: Optional[set[str]] = None,
         intent: Optional[str] = None,
     ) -> List[FusedResult]:

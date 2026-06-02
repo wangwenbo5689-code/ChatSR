@@ -5,10 +5,11 @@ from loguru import logger
 from transformers import TextIteratorStreamer
 
 from app.api.route_utils import clamp_generation_params
+from app.core.rag_defaults import DEFAULT_CONTEXT_LEN, DEFAULT_MAX_NEW_TOKENS, DEFAULT_TEMPERATURE
 from app.services.rag_retrieval_service import DocumentSelectionRequiredError
 
-DEFAULT_MAX_LENGTH = 768
-DOCUMENT_SELECTION_REQUIRED_MESSAGE = "请先在右侧文档列表选择一篇要概述的文档，然后再让我总结整篇论文。"
+DEFAULT_MAX_LENGTH = DEFAULT_MAX_NEW_TOKENS
+DOCUMENT_SELECTION_REQUIRED_MESSAGE = DocumentSelectionRequiredError.DEFAULT_MESSAGE
 DOCUMENT_SINGLE_SELECTION_REQUIRED_MESSAGE = DocumentSelectionRequiredError.SINGLE_DOCUMENT_MESSAGE
 
 
@@ -153,9 +154,9 @@ class RagGenerationService:
     def stream_generate_answer(
         self,
         max_new_tokens=DEFAULT_MAX_LENGTH,
-        temperature=0.2,
+        temperature=DEFAULT_TEMPERATURE,
         repetition_penalty=1.0,
-        context_len=8192,
+        context_len=DEFAULT_CONTEXT_LEN,
         history=None,
         history_summary=None,
     ):
@@ -211,8 +212,8 @@ class RagGenerationService:
         self,
         query: str,
         max_length: int = DEFAULT_MAX_LENGTH,
-        context_len: int = 8192,
-        temperature: float = 0.2,
+        context_len: int = DEFAULT_CONTEXT_LEN,
+        temperature: float = DEFAULT_TEMPERATURE,
         history=None,
         history_summary=None,
         selected_doc_paths=None,
@@ -270,8 +271,8 @@ class RagGenerationService:
         self,
         query: str,
         max_length: int = DEFAULT_MAX_LENGTH,
-        context_len: int = 8192,
-        temperature: float = 0.2,
+        context_len: int = DEFAULT_CONTEXT_LEN,
+        temperature: float = DEFAULT_TEMPERATURE,
         selected_doc_paths=None,
         trace_ctx=None,
         intent=None,

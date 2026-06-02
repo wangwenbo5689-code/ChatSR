@@ -9,14 +9,20 @@ from typing import Iterable, List, Sequence, Tuple
 from fastapi import HTTPException, UploadFile
 from loguru import logger
 
+from app.core.rag_defaults import (
+    DEFAULT_MAX_FILE_SIZE_MB,
+    DEFAULT_MAX_FILES_PER_UPLOAD,
+    FILE_READ_CHUNK_SIZE_BYTES,
+)
+
 
 class CorpusService:
     def __init__(
         self,
         local_corpus_dir: Path,
         allowed_exts: Iterable[str],
-        max_files_per_upload: int = 10,
-        max_file_size_mb: int = 20,
+        max_files_per_upload: int = DEFAULT_MAX_FILES_PER_UPLOAD,
+        max_file_size_mb: int = DEFAULT_MAX_FILE_SIZE_MB,
     ):
         self.local_corpus_dir = Path(local_corpus_dir)
         self.allowed_exts = set(allowed_exts)
@@ -27,7 +33,7 @@ class CorpusService:
     def md5_file(path: str) -> str:
         hasher = hashlib.md5()
         with open(path, "rb") as file:
-            for chunk in iter(lambda: file.read(1024 * 1024), b""):
+            for chunk in iter(lambda: file.read(FILE_READ_CHUNK_SIZE_BYTES), b""):
                 hasher.update(chunk)
         return hasher.hexdigest()
 
@@ -42,7 +48,7 @@ class CorpusService:
         total_size = 0
         with open(temp_path, "wb") as out:
             while True:
-                chunk = upload_file.file.read(1024 * 1024)
+                chunk = upload_file.file.read(FILE_READ_CHUNK_SIZE_BYTES)
                 if not chunk:
                     break
                 if not first_bytes:
@@ -60,7 +66,7 @@ class CorpusService:
             return "type"
         if ext not in self.allowed_exts:
             return "type"
-        if total_size > self.max_file_size_mb * 1024 * 1024:
+        if total_size > self.max_file_size_mb * FILE_READ_CHUNK_SIZE_BYTES:
             return "size"
         if ext == ".pdf" and not first_bytes.startswith(b"%PDF-"):
             return "type"

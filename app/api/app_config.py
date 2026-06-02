@@ -13,8 +13,18 @@ from pathlib import Path
 from typing import Any, Dict, Tuple
 
 from app.core.rag_defaults import (
-    EMBEDDING_MODEL_DIRNAME,
-    EMBEDDING_MODEL_NAME,
+    DEFAULT_ALLOWED_EXTS,
+    DEFAULT_CHUNK_OVERLAP,
+    DEFAULT_CHUNK_SIZE,
+    DEFAULT_CORS_ORIGINS,
+    DEFAULT_GENERATE_MODEL_NAME,
+    DEFAULT_GENERATE_MODEL_TYPE,
+    DEFAULT_HISTORY_KEEP_TURNS,
+    DEFAULT_HISTORY_SUMMARY_TURNS,
+    DEFAULT_MAX_FILE_SIZE_MB,
+    DEFAULT_MAX_FILES_PER_UPLOAD,
+    DEFAULT_OLLAMA_HOST,
+    DEFAULT_RERANK_MODEL_NAME,
     default_generation_limits,
     default_retrieval_strategy,
 )
@@ -77,14 +87,14 @@ def parse_runtime_args():
     parser.add_argument(
         "--gen_model_type",
         type=str,
-        default="ollama",
-        help="生成模型类型 (默认: ollama)",
+        default=DEFAULT_GENERATE_MODEL_TYPE,
+        help=f"生成模型类型 (默认: {DEFAULT_GENERATE_MODEL_TYPE})",
     )
     parser.add_argument(
         "--gen_model_name",
         type=str,
-        default="qwen2.5:3b",
-        help="生成模型名称 (默认: qwen2.5:3b)",
+        default=DEFAULT_GENERATE_MODEL_NAME,
+        help=f"生成模型名称 (默认: {DEFAULT_GENERATE_MODEL_NAME})",
     )
     parser.add_argument(
         "--lora_model",
@@ -95,8 +105,8 @@ def parse_runtime_args():
     parser.add_argument(
         "--rerank_model_name",
         type=str,
-        default="BAAI/bge-reranker-base",
-        help="重排模型名称 (默认: BAAI/bge-reranker-base)",
+        default=DEFAULT_RERANK_MODEL_NAME,
+        help=f"重排模型名称或路径 (默认: {DEFAULT_RERANK_MODEL_NAME})",
     )
     parser.add_argument(
         "--device",
@@ -127,36 +137,36 @@ def parse_runtime_args():
     parser.add_argument(
         "--chunk_size",
         type=int,
-        default=256,
-        help="文档分块大小，按 token 计 (默认: 256)",
+        default=DEFAULT_CHUNK_SIZE,
+        help=f"文档分块大小，按 token 计 (默认: {DEFAULT_CHUNK_SIZE})",
     )
     parser.add_argument(
         "--chunk_overlap",
         type=int,
-        default=50,
-        help="相邻分块之间的重叠 token 数 (默认: 50)",
+        default=DEFAULT_CHUNK_OVERLAP,
+        help=f"相邻分块之间的重叠 token 数 (默认: {DEFAULT_CHUNK_OVERLAP})",
     )
 
     # -------- 历史记录配置 --------
     parser.add_argument(
         "--history_max_turns",
         type=int,
-        default=6,
-        help="保留的最大对话轮次 (默认: 6)",
+        default=DEFAULT_HISTORY_SUMMARY_TURNS,
+        help=f"生成历史摘要时使用的最近历史轮次 (默认: {DEFAULT_HISTORY_SUMMARY_TURNS})",
     )
     parser.add_argument(
         "--history_keep_last_turns",
         type=int,
-        default=2,
-        help="压缩后保留的最后几轮对话 (默认: 2)",
+        default=DEFAULT_HISTORY_KEEP_TURNS,
+        help=f"压缩后保留的最后几轮对话 (默认: {DEFAULT_HISTORY_KEEP_TURNS})",
     )
 
     # -------- Ollama 配置 --------
     parser.add_argument(
         "--ollama_host",
         type=str,
-        default="http://127.0.0.1:11434",
-        help="Ollama 服务地址 (默认: http://127.0.0.1:11434)",
+        default=DEFAULT_OLLAMA_HOST,
+        help=f"Ollama 服务地址 (默认: {DEFAULT_OLLAMA_HOST})",
     )
 
     # -------- Docling PDF 解析配置 --------
@@ -267,12 +277,12 @@ def build_runtime_config(args) -> ApiRuntimeConfig:
         static_dir=project_root / "app" / "utils",
 
         # -------- 文件上传配置 --------
-        allowed_exts=(".pdf",),              # 目前仅支持 PDF
-        max_files_per_upload=10,             # 单次最多上传 10 个文件
-        max_file_size_mb=20,                 # 单个文件最大 20MB
+        allowed_exts=DEFAULT_ALLOWED_EXTS,
+        max_files_per_upload=DEFAULT_MAX_FILES_PER_UPLOAD,
+        max_file_size_mb=DEFAULT_MAX_FILE_SIZE_MB,
 
         # -------- CORS 配置 --------
-        cors_origins=("http://localhost:8000", "http://127.0.0.1:8000"),
+        cors_origins=DEFAULT_CORS_ORIGINS,
 
         # -------- 生成与检索配置 --------
         generation_limits=generation_limits,
@@ -305,6 +315,8 @@ def build_runtime_config(args) -> ApiRuntimeConfig:
 
             # 历史记录
             "enable_history": True,
+            "history_summary_turns": args.history_max_turns,
+            "history_keep_last_turns": args.history_keep_last_turns,
 
             # Ollama 配置
             "ollama_host": args.ollama_host,

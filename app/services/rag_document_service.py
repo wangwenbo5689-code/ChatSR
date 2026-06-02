@@ -4,6 +4,7 @@ from typing import Any, Dict, List
 from loguru import logger
 
 from app.core.docling_academic_chunker import create_docling_academic_chunker
+from app.core.rag_defaults import DEFAULT_CHUNK_OVERLAP, DEFAULT_CHUNK_SIZE, MIN_CHUNK_SIZE
 from app.core.rag_common import ACADEMIC_TOKENIZER_LOCAL_DIRNAME, ACADEMIC_TOKENIZER_MODEL_NAME, make_chunk_item
 
 
@@ -21,8 +22,8 @@ class RagDocumentService:
         if self.rag.docling_academic_chunker is not None or not self.rag.docling_extractor:
             return
         try:
-            max_tokens = max(int(getattr(self.rag, "chunk_size", 256) or 256), 64)
-            overlap_tokens = max(int(getattr(self.rag, "chunk_overlap", 50) or 50), 0)
+            max_tokens = max(int(getattr(self.rag, "chunk_size", DEFAULT_CHUNK_SIZE) or DEFAULT_CHUNK_SIZE), MIN_CHUNK_SIZE)
+            overlap_tokens = max(int(getattr(self.rag, "chunk_overlap", DEFAULT_CHUNK_OVERLAP) or DEFAULT_CHUNK_OVERLAP), 0)
             self.rag.docling_academic_chunker = create_docling_academic_chunker({
                 "max_tokens": max_tokens,
                 "overlap_tokens": overlap_tokens,

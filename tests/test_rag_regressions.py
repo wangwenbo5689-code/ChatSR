@@ -856,7 +856,7 @@ class FastApiArchitectureRefactorTests(unittest.TestCase):
             "int4": False,
             "int8": False,
             "chunk_size": 256,
-            "chunk_overlap": 50,
+            "chunk_overlap": 30,
             "history_max_turns": 6,
             "history_keep_last_turns": 2,
             "ollama_host": "http://127.0.0.1:11434",

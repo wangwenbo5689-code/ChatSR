@@ -3,24 +3,39 @@ from typing import Callable, List, Tuple
 
 from loguru import logger
 
+from app.core.rag_defaults import (
+    DEFAULT_HISTORY_KEEP_TURNS,
+    DEFAULT_HISTORY_SUMMARY_TURNS,
+    DEFAULT_SUMMARY_MAX_NEW_TOKENS,
+    DEFAULT_SUMMARY_TEMPERATURE,
+)
 from app.core.rag_prompts import SUMMARY_PROMPT_TEMPLATE
 
 
 class RagHistoryManager:
     """RAG 历史记录管理器"""
 
-    RECENT_SUMMARY_TURNS = 5  # 用于生成摘要的历史轮数
-    RECENT_KEEP_TURNS = 2      # 需要保留的最近对话轮数
-    DEFAULT_MAX_NEW_TOKENS = 256
-    DEFAULT_TEMPERATURE = 0.2
+    RECENT_SUMMARY_TURNS = DEFAULT_HISTORY_SUMMARY_TURNS
+    RECENT_KEEP_TURNS = DEFAULT_HISTORY_KEEP_TURNS
+    DEFAULT_MAX_NEW_TOKENS = DEFAULT_SUMMARY_MAX_NEW_TOKENS
+    DEFAULT_TEMPERATURE = DEFAULT_SUMMARY_TEMPERATURE
 
-    def __init__(self, stream_generate_answer: Callable[..., Iterable[str]]):
+    def __init__(
+        self,
+        stream_generate_answer: Callable[..., Iterable[str]],
+        summary_turns: int = DEFAULT_HISTORY_SUMMARY_TURNS,
+        keep_turns: int = DEFAULT_HISTORY_KEEP_TURNS,
+    ):
         """初始化历史记录管理器
 
         Args:
             stream_generate_answer: 流式生成回答的函数
         """
         self.stream_generate_answer = stream_generate_answer
+        resolved_summary_turns = DEFAULT_HISTORY_SUMMARY_TURNS if summary_turns is None else summary_turns
+        resolved_keep_turns = DEFAULT_HISTORY_KEEP_TURNS if keep_turns is None else keep_turns
+        self.summary_turns = max(int(resolved_summary_turns), 0)
+        self.keep_turns = max(int(resolved_keep_turns), 0)
 
     @staticmethod
     def format_history_pairs(pairs: List[List[str]]) -> str:
@@ -105,7 +120,7 @@ class RagHistoryManager:
         new_summary = self._generate_dialogue_summary(history, history_summary)
 
         # 始终保留最近 2 轮对话
-        keep_turns = self.RECENT_KEEP_TURNS
+        keep_turns = self.keep_turns
 
         if keep_turns == 0:
             return [], new_summary
@@ -123,13 +138,15 @@ class RagHistoryManager:
         """
         # 获取最近两轮对话之前的5轮对话用于生成摘要
         # 例如：历史记录有10轮，那么取轮次 3-7（索引 2-6）
-        if len(history) <= self.RECENT_KEEP_TURNS:
+        if len(history) <= self.keep_turns:
             # 历史不足以产生新摘要时，保留已有压缩记忆。
             return old_summary or ""
 
         # 计算需要摘要的对话范围
-        summary_start = max(0, len(history) - self.RECENT_KEEP_TURNS - self.RECENT_SUMMARY_TURNS)
-        summary_end = len(history) - self.RECENT_KEEP_TURNS
+        if self.summary_turns == 0:
+            return old_summary or ""
+        summary_start = max(0, len(history) - self.keep_turns - self.summary_turns)
+        summary_end = len(history) - self.keep_turns
         summary_turns = history[summary_start:summary_end]
 
         dialogue_str = self.format_history_pairs(summary_turns)

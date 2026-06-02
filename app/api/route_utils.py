@@ -2,6 +2,8 @@ from fastapi import HTTPException
 from loguru import logger
 from pydantic import BaseModel, Field
 
+from app.core.rag_defaults import default_generation_limits
+
 
 def require_non_empty_text(value: str, detail: str) -> str:
     text = (value or "").strip()
@@ -64,18 +66,8 @@ def clamp_generation_params(
     对 None 值用默认值填充，超出边界时裁剪到合法范围内。
     不抛出异常，由 Pydantic 模型在前置层完成校验。
     """
-    defaults = {
-        "max_length_default": 768,
-        "max_length_min": 64,
-        "max_length_max": 1024,
-        "context_len_default": 8192,
-        "context_len_min": 1024,
-        "context_len_max": 32768,
-        "temperature_default": 0.2,
-        "temperature_min": 0.0,
-        "temperature_max": 1.0,
-    }
-    defaults.update(limits)
+    defaults = default_generation_limits()
+    defaults.update(limits or {})
 
     max_length = int(max_length or defaults["max_length_default"])
     context_len = int(context_len or defaults["context_len_default"])

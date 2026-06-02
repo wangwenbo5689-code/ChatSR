@@ -647,13 +647,27 @@ class ParentDocumentRetrieverTests(unittest.TestCase):
                 },
             },
             "doc-1_paper_sec_1": {
-                "document": "all authors contributed equally",
+                "document": "method section body should be filtered",
                 "metadata": {
                     "section_id": "doc-1_paper_sec_1",
                     "paper_id": "doc-1_paper",
+                    "section_title": "Methods",
+                    "section_hierarchy": "Methods",
+                    "section_number": "2",
+                    "start_page": 3,
+                    "end_page": 5,
+                    "chunk_count": 1,
+                    "doc_hash": "doc-1",
+                },
+            },
+            "doc-1_paper_sec_2": {
+                "document": "all authors contributed equally",
+                "metadata": {
+                    "section_id": "doc-1_paper_sec_2",
+                    "paper_id": "doc-1_paper",
                     "section_title": "Author Contributions",
                     "section_hierarchy": "Author Contributions",
-                    "section_number": "2",
+                    "section_number": "3",
                     "start_page": 9,
                     "end_page": 9,
                     "chunk_count": 1,
@@ -661,7 +675,38 @@ class ParentDocumentRetrieverTests(unittest.TestCase):
                 },
             },
         })
-        retriever.element_collection = FakeCollection({})
+        retriever.element_collection = FakeCollection({
+            "doc-1_paper_sec_0_elem_1": {
+                "document": "second introduction element",
+                "metadata": {
+                    "section_id": "doc-1_paper_sec_0",
+                    "section_title": "Introduction",
+                    "position": 2,
+                    "chunk_index": 1,
+                    "doc_hash": "doc-1",
+                },
+            },
+            "doc-1_paper_sec_0_elem_0": {
+                "document": "first introduction element",
+                "metadata": {
+                    "section_id": "doc-1_paper_sec_0",
+                    "section_title": "Introduction",
+                    "position": 1,
+                    "chunk_index": 0,
+                    "doc_hash": "doc-1",
+                },
+            },
+            "doc-1_paper_sec_1_elem_0": {
+                "document": "method implementation details should be filtered",
+                "metadata": {
+                    "section_id": "doc-1_paper_sec_1",
+                    "section_title": "Methods",
+                    "position": 1,
+                    "chunk_index": 0,
+                    "doc_hash": "doc-1",
+                },
+            },
+        })
 
         payload = retriever.retrieve(
             "summarize the whole paper",
@@ -672,9 +717,18 @@ class ParentDocumentRetrieverTests(unittest.TestCase):
 
         self.assertEqual(payload["citations"][0]["type"], "paper")
         self.assertEqual(payload["structured"][0]["level"], "paper")
-        self.assertEqual(payload["structured"][0]["sections"][0]["title"], "Introduction")
+        self.assertEqual(
+            [section["title"] for section in payload["structured"][0]["sections"]],
+            ["Introduction"],
+        )
         self.assertIn("paper abstract", payload["blocks"][0])
-        self.assertIn("introduction representative content", payload["blocks"][0])
+        self.assertIn("【各章节全部内容】", payload["blocks"][0])
+        self.assertLess(
+            payload["blocks"][0].find("first introduction element"),
+            payload["blocks"][0].find("second introduction element"),
+        )
+        self.assertNotIn("method section body should be filtered", payload["blocks"][0])
+        self.assertNotIn("method implementation details should be filtered", payload["blocks"][0])
         self.assertNotIn("all authors contributed equally", payload["blocks"][0])
 
     def test_document_overview_uses_selected_doc_hash_without_retrieval(self):

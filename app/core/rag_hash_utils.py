@@ -2,6 +2,8 @@ import hashlib
 import os
 from typing import Iterable
 
+from app.core.rag_defaults import FILE_READ_CHUNK_SIZE_BYTES
+
 
 def file_md5_hex_32(file_path: str) -> str:
     """计算文件的 MD5 哈希值（32位）
@@ -14,7 +16,7 @@ def file_md5_hex_32(file_path: str) -> str:
     """
     hasher = hashlib.md5()
     with open(file_path, 'rb') as file:
-        for chunk in iter(lambda: file.read(1024 * 1024), b""):
+        for chunk in iter(lambda: file.read(FILE_READ_CHUNK_SIZE_BYTES), b""):
             hasher.update(chunk)
     return hasher.hexdigest()[:32]
 
@@ -31,7 +33,7 @@ def files_md5_hex_32(file_paths: Iterable[str]) -> str:
     hasher = hashlib.md5()
     for file_path in sorted(file_paths):
         with open(file_path, 'rb') as file:
-            for chunk in iter(lambda: file.read(1024 * 1024), b""):
+            for chunk in iter(lambda: file.read(FILE_READ_CHUNK_SIZE_BYTES), b""):
                 hasher.update(chunk)
     return hasher.hexdigest()[:32]
 

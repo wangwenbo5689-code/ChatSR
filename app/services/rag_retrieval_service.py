@@ -2,6 +2,12 @@ from typing import Any, List, Optional, Set
 
 from loguru import logger
 
+from app.core.rag_defaults import (
+    DEFAULT_ELEMENT_CANDIDATE_POOL_SIZE,
+    DEFAULT_FINAL_CONTEXT_TOP_K,
+    DEFAULT_PARENT_RERANK_TOP_K,
+    DEFAULT_SUB_QUERY_SCORE_BOOST,
+)
 from app.core.rag_hash_utils import file_md5_hex_32
 from app.core.rag_common import add_source_numbers
 from app.core.hierarchical_types import FusedResult
@@ -16,10 +22,10 @@ class DocumentSelectionRequiredError(RuntimeError):
 
 
 class RagRetrievalService:
-    HIERARCHICAL_RETRIEVE_TOP_N = 12
-    FINAL_QUERY_TOP_K = 5
-    FINAL_CONTEXT_TOP_K = 4
-    SUB_QUERY_HIT_BOOST = 0.15
+    HIERARCHICAL_RETRIEVE_TOP_N = DEFAULT_ELEMENT_CANDIDATE_POOL_SIZE
+    FINAL_QUERY_TOP_K = DEFAULT_PARENT_RERANK_TOP_K
+    FINAL_CONTEXT_TOP_K = DEFAULT_FINAL_CONTEXT_TOP_K
+    SUB_QUERY_HIT_BOOST = DEFAULT_SUB_QUERY_SCORE_BOOST
     VALID_INTENTS = {"document_overview", "general_overview", "fact_qa"}
 
     def __init__(self, rag):
