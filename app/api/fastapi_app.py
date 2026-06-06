@@ -32,7 +32,7 @@ from app.api.routes import (
     system_router,
 )
 from app.core.rag_runtime import RagBootstrap
-from app.core.rag_defaults import DEFAULT_OLLAMA_HOST, EMBEDDING_MODEL_NAME
+from app.core.rag_defaults import API_GENERATE_MODEL_TYPES, API_KEY_ENV_NAMES, DEFAULT_OLLAMA_HOST, EMBEDDING_MODEL_NAME
 
 
 def create_app(config=None):
@@ -67,7 +67,8 @@ def create_app(config=None):
         model_kwargs = rt_config.model_init_kwargs
         errors = []
 
-        if model_kwargs.get("generate_model_type") == "ollama":
+        generate_model_type = str(model_kwargs.get("generate_model_type") or "").strip().lower()
+        if generate_model_type == "ollama":
             ollama_host = model_kwargs.get("ollama_host") or os.getenv("OLLAMA_HOST", DEFAULT_OLLAMA_HOST)
             try:
                 req = urllib.request.Request(f"{ollama_host.rstrip('/')}/api/tags", method="GET")
@@ -75,6 +76,17 @@ def create_app(config=None):
                 logger.info(f"Ollama 服务可达: {ollama_host}")
             except Exception:
                 errors.append(f"Ollama 服务不可达 ({ollama_host})，请确认 ollama serve 已启动")
+
+        elif generate_model_type in API_GENERATE_MODEL_TYPES:
+            api_key = model_kwargs.get("api_key") or next(
+                (os.getenv(env_name) for env_name in API_KEY_ENV_NAMES if os.getenv(env_name)),
+                "",
+            )
+            api_base_url = str(model_kwargs.get("api_base_url") or "").strip()
+            if not api_key:
+                errors.append(f"LLM API key is not configured. Set one of: {', '.join(API_KEY_ENV_NAMES)}")
+            if not api_base_url.startswith(("http://", "https://")):
+                errors.append(f"Invalid LLM API base URL: {api_base_url}")
 
         embedding_model_dir = EMBEDDING_MODEL_NAME
         if not os.path.isdir(embedding_model_dir):

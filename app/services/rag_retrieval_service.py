@@ -1,12 +1,10 @@
-from typing import Any, List, Optional, Set
+import re
+from typing import List, Optional, Set
 
 from loguru import logger
 
 from app.core.rag_defaults import (
     DEFAULT_ELEMENT_CANDIDATE_POOL_SIZE,
-    DEFAULT_FINAL_CONTEXT_TOP_K,
-    DEFAULT_PARENT_RERANK_TOP_K,
-    DEFAULT_SUB_QUERY_SCORE_BOOST,
 )
 from app.core.rag_hash_utils import file_md5_hex_32
 from app.core.rag_common import add_source_numbers
@@ -23,14 +21,12 @@ class DocumentSelectionRequiredError(RuntimeError):
 
 class RagRetrievalService:
     HIERARCHICAL_RETRIEVE_TOP_N = DEFAULT_ELEMENT_CANDIDATE_POOL_SIZE
-    FINAL_QUERY_TOP_K = DEFAULT_PARENT_RERANK_TOP_K
-    FINAL_CONTEXT_TOP_K = DEFAULT_FINAL_CONTEXT_TOP_K
-    SUB_QUERY_HIT_BOOST = DEFAULT_SUB_QUERY_SCORE_BOOST
     VALID_INTENTS = {"document_overview", "general_overview", "fact_qa"}
+    FACT_QUERY_MAX_VARIANTS = 5
+    GENERAL_OVERVIEW_QUERY_MAX_VARIANTS = 4
 
     def __init__(self, rag):
         self.rag = rag
-        self._latest_hit_scores: dict[str, float] = {}
         self.strategy = getattr(rag, "retrieval_strategy", {}) or {}
 
     def _get_strategy_number(self, key: str, default: float) -> float:
@@ -139,106 +135,6 @@ class RagRetrievalService:
             raise DocumentSelectionRequiredError(DocumentSelectionRequiredError.SINGLE_DOCUMENT_MESSAGE)
         return next(iter(allowed_doc_hashes))
 
-    def try_hierarchical_retrieve(self, query: str, allowed_doc_hashes: Optional[Set[str]] = None, intent: str | None = None) -> List[dict]:
-        ret_dict = self.rag.hierarchical_retriever.retrieve(
-            query=query,
-            topn=int(self._get_strategy_number("element_candidate_pool_size", self.HIERARCHICAL_RETRIEVE_TOP_N)),
-            allowed_doc_hashes=allowed_doc_hashes,
-            intent=intent,
-        )
-        self._latest_hit_scores = self._extract_retrieval_scores(ret_dict)
-        return self._extract_retrieval_data(ret_dict)
-
-    @staticmethod
-    def _extract_retrieval_scores(ret_dict) -> dict[str, float]:
-        if not isinstance(ret_dict, dict):
-            return {}
-        structured = ret_dict.get("structured", []) or []
-        section_scores: dict[str, float] = {}
-        for paper in structured:
-            if not isinstance(paper, dict):
-                continue
-            for section in (paper.get("sections") or []):
-                if not isinstance(section, dict):
-                    continue
-                section_id = str(section.get("id", "")).strip()
-                if section_id:
-                    section_scores[section_id] = float(section.get("score", 0) or 0)
-
-        score_map: dict[str, float] = {}
-        blocks = ret_dict.get("blocks", []) or []
-        citations = ret_dict.get("citations", []) or []
-        for idx, block in enumerate(blocks):
-            if not isinstance(block, str):
-                continue
-            text = block.strip()
-            if not text:
-                continue
-            score = 0.0
-            if idx < len(citations) and isinstance(citations[idx], dict):
-                sec_id = str(citations[idx].get("section_id", "")).strip()
-                score = section_scores.get(sec_id, 0.0)
-            score_map[text] = max(score_map.get(text, 0.0), score)
-        return score_map
-
-    def _fuse_multi_query_hits(self, all_query_hits: List[List[dict]], all_query_scores: List[dict[str, float]]) -> List[dict]:
-        merged: dict[str, dict[str, Any]] = {}
-        first_seen_order = 0
-        for hits, score_map in zip(all_query_hits, all_query_scores):
-            seen_in_query: set[str] = set()
-            query_top_k = int(self._get_strategy_number("parent_rerank_top_k", self.FINAL_QUERY_TOP_K))
-            for hit in hits[:query_top_k]:
-                text = hit["text"]
-                metadata = hit["metadata"]
-                dedupe_key = self._build_section_dedupe_key(metadata=metadata, text=text)
-
-                normalized = text.strip()
-                if not normalized:
-                    continue
-                if dedupe_key not in merged:
-                    merged[dedupe_key] = {
-                        "text": text,
-                        "metadata": metadata,
-                        "hit_count": 0,
-                        "section_score": 0.0,
-                        "first_order": first_seen_order,
-                    }
-                    first_seen_order += 1
-                if dedupe_key not in seen_in_query:
-                    merged[dedupe_key]["hit_count"] += 1
-                    seen_in_query.add(dedupe_key)
-                merged[dedupe_key]["section_score"] = max(
-                    merged[dedupe_key]["section_score"],
-                    score_map.get(normalized, 0.0),
-                )
-
-        final_context_top_k = int(self._get_strategy_number("final_context_top_k", self.FINAL_CONTEXT_TOP_K))
-        if len(merged) <= final_context_top_k:
-            ordered = sorted(merged.values(), key=lambda p: p["first_order"])
-            return [{"text": p["text"], "metadata": p["metadata"]} for p in ordered]
-
-        hit_boost = self._get_strategy_number("sub_query_score_boost", self.SUB_QUERY_HIT_BOOST)
-        ranked = []
-        for payload in merged.values():
-            fused_score = payload["section_score"] * (1.0 + payload["hit_count"] * hit_boost)
-            ranked.append((payload, fused_score))
-
-        ranked.sort(key=lambda item: (item[1], -item[0]["first_order"]), reverse=True)
-        return [{"text": p["text"], "metadata": p["metadata"]} for p, _ in ranked[:final_context_top_k]]
-
-    @staticmethod
-    def _build_section_dedupe_key(metadata: dict | None, text: str) -> str:
-        meta = metadata if isinstance(metadata, dict) else {}
-        section_id = str(meta.get("section_id") or "").strip()
-        if section_id:
-            return f"section_id:{section_id}"
-        paper_title = str(meta.get("paper_title") or "").strip().lower()
-        section_title = str(meta.get("section_title") or "").strip().lower()
-        page = str(meta.get("page") or "").strip()
-        if section_title:
-            return f"section:{paper_title}|{section_title}|{page}"
-        return f"text:{text.strip().lower()}"
-
     def _classify_intent_once(self, query: str, intent: str | None = None) -> str:
         normalized = (intent or "").strip().lower() if isinstance(intent, str) else ""
         if normalized in self.VALID_INTENTS:
@@ -254,6 +150,223 @@ class RagRetrievalService:
             )
         except TypeError:
             return self.rag._expand_query(query)
+
+    @staticmethod
+    def _dedupe_queries(queries: List[str], limit: int) -> List[str]:
+        final: List[str] = []
+        seen: set[str] = set()
+        for query in queries:
+            cleaned = re.sub(r"\s+", " ", str(query or "")).strip()
+            if not cleaned:
+                continue
+            normalized = cleaned.lower()
+            if normalized in seen:
+                continue
+            seen.add(normalized)
+            final.append(cleaned)
+            if len(final) >= limit:
+                break
+        return final
+
+    @staticmethod
+    def _split_fact_query(query: str) -> List[str]:
+        parts = re.split(r"[？?。；;]+", query or "")
+        splitters = ("相比之下", "作为对比", "同时", "以及", "此外", "并且")
+        segments: List[str] = []
+        for part in parts:
+            candidates = [part]
+            for splitter in splitters:
+                next_candidates: List[str] = []
+                for candidate in candidates:
+                    next_candidates.extend(candidate.split(splitter))
+                candidates = next_candidates
+            for candidate in candidates:
+                cleaned = candidate.strip(" ，,、：:")
+                if len(cleaned) >= 8:
+                    segments.append(cleaned)
+        return segments or [query]
+
+    @staticmethod
+    def _split_fact_query_legacy(query: str) -> List[str]:
+        parts = re.split(r"[？?。；;]+", query or "")
+        splitters = ("相比之下", "作为对比", "同时", "以及", "此外", "并且")
+        segments: List[str] = []
+        for part in parts:
+            candidates = [part]
+            for splitter in splitters:
+                next_candidates: List[str] = []
+                for candidate in candidates:
+                    next_candidates.extend(candidate.split(splitter))
+                candidates = next_candidates
+            for candidate in candidates:
+                cleaned = candidate.strip(" ，,、：:")
+                if len(cleaned) >= 8:
+                    segments.append(cleaned)
+        return segments or [query]
+
+    @staticmethod
+    def _build_fact_alias_query(query: str) -> str:
+        alias_map = (
+            ("训练数据", "training data dataset data source training mix weight"),
+            ("数据集", "dataset"),
+            ("来源", "data source source"),
+            ("权重", "weight training mix"),
+            ("参数", "parameters n params"),
+            ("层数", "layers"),
+            ("隐藏层", "hidden size"),
+            ("注意力头", "attention heads"),
+            ("错误率", "error rate top-1 top-5"),
+            ("验证集", "validation set"),
+            ("计算复杂度", "FLOPs complexity"),
+            ("成功率", "success rate"),
+            ("平均", "average"),
+            ("分数", "score"),
+            ("方差调度", "variance schedule beta"),
+            ("扩散", "diffusion"),
+            ("简化目标", "simplified training objective"),
+            ("缩放定律", "scaling laws"),
+            ("损失", "loss"),
+            ("计算", "compute"),
+            ("常数项", "constant term"),
+            ("公式", "formula equation"),
+            ("外部知识", "external knowledge"),
+            ("适应性", "adaptability"),
+            ("微调", "fine-tuning"),
+            ("检索增强", "retrieval augmented generation RAG"),
+            ("表", "table"),
+        )
+        aliases: List[str] = []
+        for marker, alias in alias_map:
+            if marker in query:
+                aliases.append(alias)
+        ascii_terms = re.findall(r"[A-Za-z][A-Za-z0-9_.+-]*|\d+(?:\.\d+)?%?", query or "")
+        return " ".join(ascii_terms + aliases).strip()
+
+    def _augment_fact_queries(self, original_query: str, expanded_queries: List[str]) -> List[str]:
+        _ = expanded_queries
+        return self._build_fact_english_queries(original_query)
+
+    @staticmethod
+    def _clean_generated_fact_query(text: str) -> str:
+        for line in re.split(r"[\n\r]+", text or ""):
+            cleaned = re.sub(r"^(\d+[\.\)]|[-*â€¢])\s*", "", line).strip(' \t"`\'"""\'\'\'')
+            cleaned = re.sub(r"^(english\s+)?(retrieval\s+)?query\s*[:：]\s*", "", cleaned, flags=re.IGNORECASE)
+            cleaned = re.sub(r"\s+", " ", cleaned).strip()
+            if cleaned:
+                return cleaned
+        return ""
+
+    @staticmethod
+    def _clean_generated_query_line(text: str) -> str:
+        cleaned = re.sub(r"^\s*(?:\d+[\.\)]|[-*])\s*", "", text or "")
+        cleaned = cleaned.strip(" \t`\"'[]")
+        cleaned = re.sub(
+            r"^(english\s+)?(retrieval\s+)?(sub[-\s]?query|query|rewrite|variant)(?:\s+\d+)?\s*:\s*",
+            "",
+            cleaned,
+            flags=re.IGNORECASE,
+        )
+        cleaned = cleaned.strip(" \t`\"',;")
+        return re.sub(r"\s+", " ", cleaned).strip()
+
+    def _parse_generated_english_queries(self, generated: str, *, limit: int) -> List[str]:
+        raw_lines = [line for line in re.split(r"[\n\r]+", generated or "") if line.strip()]
+        if len(raw_lines) == 1:
+            raw_lines = [line for line in re.split(r"\s*;\s*", raw_lines[0]) if line.strip()]
+        cleaned = [self._clean_generated_query_line(line) for line in raw_lines]
+        return self._dedupe_queries(cleaned, limit=limit)
+
+    def _generate_english_queries(self, original_query: str, *, intent_label: str, prompt: str, limit: int) -> List[str]:
+        generator = getattr(getattr(self.rag, "query_expander", None), "generate_summary", None)
+        if not callable(generator):
+            generator = getattr(self.rag, "_generate_summary", None)
+        if not callable(generator):
+            return self._dedupe_queries([original_query], limit=limit)
+
+        try:
+            generated = generator(prompt, max_new_tokens=160, temperature=0.0)
+        except Exception as exc:
+            logger.warning(f"{intent_label} query rewrite failed, using original query: {exc}")
+            return self._dedupe_queries([original_query], limit=limit)
+
+        parsed = self._parse_generated_english_queries(str(generated or ""), limit=limit)
+        return parsed or self._dedupe_queries([original_query], limit=limit)
+
+    def _build_fact_english_sub_queries_with_generator(self, original_query: str) -> List[str]:
+        prompt = (
+            "Split the following academic fact question into English retrieval sub-queries.\n"
+            "Preserve paper titles, model names, dataset names, numbers, symbols, formulas, and table names.\n"
+            f"Return at most {self.FACT_QUERY_MAX_VARIANTS} sub-queries. If the question is simple, return one sub-query.\n"
+            "Use English only. Do not answer the question. Output one sub-query per line, with no explanation.\n\n"
+            f"Question:\n{original_query}"
+        )
+        return self._generate_english_queries(
+            original_query,
+            intent_label="fact_qa",
+            prompt=prompt,
+            limit=self.FACT_QUERY_MAX_VARIANTS,
+        )
+
+    def _build_overview_english_rewrite_queries_with_generator(self, original_query: str) -> List[str]:
+        prompt = (
+            "Rewrite the following academic overview question into English retrieval query variants.\n"
+            "Each variant should represent the full original question, not a separate sub-question.\n"
+            "Focus on broad concepts, methods, contributions, comparisons, limitations, and section-level keywords.\n"
+            f"Return at most {self.GENERAL_OVERVIEW_QUERY_MAX_VARIANTS} rewritten queries. If one query is enough, return one query.\n"
+            "Use English only. Do not answer the question. Output one rewritten query per line, with no explanation.\n\n"
+            f"Question:\n{original_query}"
+        )
+        return self._generate_english_queries(
+            original_query,
+            intent_label="general_overview",
+            prompt=prompt,
+            limit=self.GENERAL_OVERVIEW_QUERY_MAX_VARIANTS,
+        )
+
+    def _rewrite_sub_query_to_english(self, sub_query: str, *, intent_label: str) -> str:
+        generator = getattr(getattr(self.rag, "query_expander", None), "generate_summary", None)
+        if not callable(generator):
+            generator = getattr(self.rag, "_generate_summary", None)
+        if not callable(generator):
+            return sub_query
+
+        if intent_label == "general_overview":
+            instruction = (
+                "Rewrite the following academic overview question segment into ONE concise English retrieval query.\n"
+                "Focus on broad concepts, methods, contributions, comparisons, limitations, and section-level keywords.\n"
+            )
+        else:
+            instruction = (
+                "Rewrite the following academic question segment into ONE concise English retrieval query.\n"
+                "Preserve paper titles, model names, dataset names, numbers, symbols, formulas, and table names.\n"
+            )
+        prompt = (
+            instruction +
+            "Use English only, with keywords likely to appear in the paper. Output only the rewritten query.\n\n"
+            f"Question segment:\n{sub_query}"
+        )
+        try:
+            generated = generator(prompt, max_new_tokens=80, temperature=0.0)
+        except Exception as exc:
+            logger.warning(f"{intent_label} query rewrite failed, using original segment: {exc}")
+            return sub_query
+        return self._clean_generated_fact_query(str(generated or "")) or sub_query
+
+    def _rewrite_fact_sub_query_to_english(self, sub_query: str) -> str:
+        return self._rewrite_sub_query_to_english(sub_query, intent_label="fact_qa")
+
+    def _build_fact_english_queries(self, original_query: str) -> List[str]:
+        return self._build_fact_english_sub_queries_with_generator(original_query)
+
+    @staticmethod
+    def _split_overview_query(query: str) -> List[str]:
+        return RagRetrievalService._split_fact_query(query)
+
+    def _rewrite_overview_sub_query_to_english(self, sub_query: str) -> str:
+        return self._rewrite_sub_query_to_english(sub_query, intent_label="general_overview")
+
+    def _build_general_overview_english_queries(self, original_query: str) -> List[str]:
+        return self._build_overview_english_rewrite_queries_with_generator(original_query)
 
     def get_reference_results(
         self,
@@ -287,11 +400,16 @@ class RagRetrievalService:
         if classified_intent == "document_overview":
             return self._run_document_overview(query=query, doc_hash=doc_hash)
 
-        expanded_queries = self._expand_query_with_optional_history(
-            query,
-            history=history,
-            history_summary=history_summary,
-        )
+        if classified_intent == "fact_qa":
+            expanded_queries = self._build_fact_english_queries(query)
+        elif classified_intent == "general_overview":
+            expanded_queries = self._build_general_overview_english_queries(query)
+        else:
+            expanded_queries = self._expand_query_with_optional_history(
+                query,
+                history=history,
+                history_summary=history_summary,
+            )
 
         if classified_intent == "fact_qa":
             return self._run_fused_pipeline(
@@ -313,11 +431,10 @@ class RagRetrievalService:
             doc_hash=doc_hash,
             query=query,
         )
-        self._latest_hit_scores = {}
         return self._extract_retrieval_data(payload)
 
     def _run_fused_pipeline(self, expanded_queries, allowed_doc_hashes, intent, *, retriever, builder, intent_label):
-        default_keep, min_k, max_k = {"fact_qa": (0.7, 1, 6), "general_overview": (0.65, 2, 6)}[intent_label]
+        default_keep, min_k, max_k = {"fact_qa": (0.6, 2, 6), "general_overview": (0.65, 2, 6)}[intent_label]
         per_query_lists: List[List[FusedResult]] = []
         for eq in expanded_queries:
             candidates = self._safe_retrieve(eq, allowed_doc_hashes, intent, method=retriever)

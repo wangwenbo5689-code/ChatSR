@@ -2,7 +2,7 @@ import unittest
 
 from app.core.hierarchical_context_builder import ContextBuilder
 from app.core.hierarchical_payload_builder import build_hierarchical_document_payloads, normalize_chunk_items
-from app.core.hierarchical_retriever import HybridRetriever
+from app.core.hierarchical_retriever import BaseCollectionRetriever, HybridRetriever
 from app.core.hierarchical_ranking import ResultFuser, ResultReranker
 from app.core.hierarchical_types import FusedResult, RetrievalResult
 
@@ -45,6 +45,30 @@ class FakeCollection:
         }
 
 
+class BaseCollectionRetrieverFilterTests(unittest.TestCase):
+    def test_where_clause_uses_non_noise_section_whitelist_before_dense_recall(self):
+        retriever = BaseCollectionRetriever.__new__(BaseCollectionRetriever)
+        retriever.doc_metadatas = [
+            {
+                "level": "element",
+                "section_id": "sec-good",
+                "section_title": "Introduction",
+                "doc_hash": "doc-1",
+            },
+            {
+                "level": "element",
+                "section_id": "sec-noise",
+                "section_title": "Author Contributions",
+                "doc_hash": "doc-1",
+            },
+        ]
+
+        where_clause = retriever._where_clause_for_doc_hashes({"doc-1"})
+
+        self.assertEqual(where_clause["$and"][0], {"doc_hash": {"$in": ["doc-1"]}})
+        self.assertEqual(where_clause["$and"][1], {"section_id": {"$in": ["sec-good"]}})
+
+
 class HierarchicalPayloadBuilderTests(unittest.TestCase):
     def test_normalize_chunk_items_centralizes_text_and_metadata_cleanup(self):
         normalized = normalize_chunk_items(
@@ -70,6 +94,10 @@ class HierarchicalPayloadBuilderTests(unittest.TestCase):
             doc_file="/tmp/demo.pdf",
             chunk_items=[
                 {
+                    "text": "Abstract: This paper studies real abstract extraction.",
+                    "metadata": {"section_title": "Abstract", "section_hierarchy": "Abstract", "source_type": "text", "page": 1},
+                },
+                {
                     "text": "attention residual block",
                     "metadata": {"section_title": "Intro", "section_hierarchy": "Intro", "source_type": "text", "page": 2},
                 },
@@ -87,9 +115,17 @@ class HierarchicalPayloadBuilderTests(unittest.TestCase):
         self.assertEqual(payloads["section"]["metadatas"][0]["parent_id"], "doc-1_paper")
         self.assertEqual(payloads["element"]["metadatas"][0]["section_id"], "doc-1_paper_sec_0")
         self.assertEqual(payloads["element"]["metadatas"][0]["parent_id"], "doc-1_paper_sec_0")
-        self.assertEqual(payloads["element"]["documents"][0], "attention residual block")
+        self.assertEqual(payloads["element"]["documents"][0], "Section: Intro\n\nattention residual block")
+        self.assertEqual(payloads["element"]["metadatas"][0]["text_content"], "attention residual block")
         self.assertEqual(payloads["element"]["ids"][0], "doc-1_paper_sec_0_elem_0")
-        self.assertNotIn("reference entry", payloads["paper"]["documents"][0])
+        paper_doc = payloads["paper"]["documents"][0]
+        paper_meta = payloads["paper"]["metadatas"][0]
+        self.assertEqual(paper_meta["abstract"], "This paper studies real abstract extraction.")
+        self.assertIn("Abstract:", paper_doc)
+        self.assertIn("This paper studies real abstract extraction.", paper_doc)
+        self.assertIn("Sections:", paper_doc)
+        self.assertNotIn("attention residual block", paper_doc)
+        self.assertNotIn("reference entry", paper_doc)
         self.assertNotIn("reference entry", payloads["element"]["documents"])
         self.assertEqual(payloads["paper"]["metadatas"][0]["page_count"], 10)
         self.assertNotIn("year", payloads["paper"]["metadatas"][0])
@@ -143,7 +179,32 @@ class HierarchicalPayloadBuilderTests(unittest.TestCase):
 
         self.assertEqual([meta["section_title"] for meta in payloads["section"]["metadatas"]], ["Method"])
         self.assertEqual([meta["section_title"] for meta in payloads["element"]["metadatas"]], ["Method"])
+        self.assertEqual(payloads["paper"]["metadatas"][0]["abstract"], "")
+        self.assertNotIn("method details", payloads["paper"]["documents"][0])
         self.assertNotIn("all authors", payloads["paper"]["documents"][0])
+
+    def test_build_payloads_extracts_inline_abstract_heading(self):
+        payloads = build_hierarchical_document_payloads(
+            doc_hash="doc-1",
+            doc_file="/tmp/demo.pdf",
+            chunk_items=[
+                {
+                    "text": "Abstract -Large language models benefit from retrieval augmentation.",
+                    "metadata": {"section_title": "Demo Paper", "section_hierarchy": "Demo Paper", "page": 1},
+                },
+                {
+                    "text": "intro details",
+                    "metadata": {"section_title": "Introduction", "section_hierarchy": "Introduction", "page": 1},
+                },
+            ],
+        )
+
+        self.assertEqual(
+            payloads["paper"]["metadatas"][0]["abstract"],
+            "Large language models benefit from retrieval augmentation.",
+        )
+        self.assertEqual([meta["section_title"] for meta in payloads["section"]["metadatas"]], ["Introduction"])
+        self.assertNotIn("intro details", payloads["paper"]["documents"][0])
 
     def test_build_payloads_keeps_parent_chunks_in_parent_section(self):
         payloads = build_hierarchical_document_payloads(
@@ -224,6 +285,8 @@ class HierarchicalPayloadBuilderTests(unittest.TestCase):
         self.assertEqual(section_meta["section_hierarchy"], "Introduction > Motivation")
         self.assertEqual(element_meta["section_title"], "Motivation")
         self.assertEqual(element_meta["section_hierarchy"], "Introduction > Motivation")
+        self.assertEqual(payloads["element"]["documents"][0], "motivation details")
+        self.assertEqual(element_meta["text_content"], "motivation details")
 
 
 class ResultFuserTests(unittest.TestCase):
@@ -359,6 +422,33 @@ class ContextBuilderTests(unittest.TestCase):
         self.assertEqual(payload["citations"][0]["type"], "element")
         self.assertEqual(payload["structured"][0]["id"], "paper-1")
         self.assertEqual(payload["structured"][0]["elements"][0]["id"], "elem-1")
+
+    def test_element_block_displays_original_text_content(self):
+        builder = ContextBuilder(max_context_length=2000)
+        fused_results = [
+            FusedResult(
+                result=RetrievalResult(
+                    id="elem-1",
+                    content="Section: Positional Encoding\n\noriginal chunk body",
+                    score=1.0,
+                    level="element",
+                    metadata={
+                        "paper_id": "paper-1",
+                        "section_title": "Positional Encoding",
+                        "page": 3,
+                        "element_type": "text",
+                        "text_content": "original chunk body",
+                    },
+                ),
+                fused_score=1.0,
+                source_scores={"element": 1.0},
+            )
+        ]
+
+        payload = builder.build(fused_results, query="positional encoding")
+
+        self.assertIn("original chunk body", payload["blocks"][0])
+        self.assertNotIn("Section: Positional Encoding", payload["blocks"][0])
 
     def test_build_keeps_first_result_when_single_section_block_exceeds_limit(self):
         builder = ContextBuilder(max_context_length=200)

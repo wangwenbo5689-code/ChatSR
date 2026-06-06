@@ -13,6 +13,12 @@ from pathlib import Path
 from typing import Any, Dict, Tuple
 
 from app.core.rag_defaults import (
+    API_GENERATE_MODEL_TYPES,
+    DEFAULT_API_BASE_URL,
+    DEFAULT_API_MODEL_NAME,
+    DEFAULT_API_PROTOCOL,
+    DEFAULT_API_TIMEOUT,
+    DEFAULT_API_VERSION,
     DEFAULT_ALLOWED_EXTS,
     DEFAULT_CHUNK_OVERLAP,
     DEFAULT_CHUNK_SIZE,
@@ -87,13 +93,13 @@ def parse_runtime_args():
     parser.add_argument(
         "--gen_model_type",
         type=str,
-        default=DEFAULT_GENERATE_MODEL_TYPE,
+        default=os.getenv("CHATSR_GEN_MODEL_TYPE", DEFAULT_GENERATE_MODEL_TYPE),
         help=f"生成模型类型 (默认: {DEFAULT_GENERATE_MODEL_TYPE})",
     )
     parser.add_argument(
         "--gen_model_name",
         type=str,
-        default=DEFAULT_GENERATE_MODEL_NAME,
+        default=os.getenv("CHATSR_GEN_MODEL_NAME", DEFAULT_GENERATE_MODEL_NAME),
         help=f"生成模型名称 (默认: {DEFAULT_GENERATE_MODEL_NAME})",
     )
     parser.add_argument(
@@ -165,12 +171,45 @@ def parse_runtime_args():
     parser.add_argument(
         "--ollama_host",
         type=str,
-        default=DEFAULT_OLLAMA_HOST,
+        default=os.getenv("OLLAMA_HOST", DEFAULT_OLLAMA_HOST),
         help=f"Ollama 服务地址 (默认: {DEFAULT_OLLAMA_HOST})",
     )
 
     # -------- Docling PDF 解析配置 --------
     # OCR 配置：启用/禁用光学字符识别
+    # -------- Hosted LLM API config --------
+    parser.add_argument(
+        "--api_base_url",
+        type=str,
+        default=os.getenv("CHATSR_LLM_API_BASE_URL") or os.getenv("DEEPSEEK_BASE_URL") or DEFAULT_API_BASE_URL,
+        help=f"LLM API base URL (default: {DEFAULT_API_BASE_URL})",
+    )
+    parser.add_argument(
+        "--api_key",
+        type=str,
+        default=os.getenv("CHATSR_LLM_API_KEY") or os.getenv("DEEPSEEK_API_KEY") or os.getenv("OPENAI_API_KEY"),
+        help="LLM API key. Prefer environment variables instead of passing secrets on the command line.",
+    )
+    parser.add_argument(
+        "--api_protocol",
+        type=str,
+        default=os.getenv("CHATSR_LLM_API_PROTOCOL", DEFAULT_API_PROTOCOL),
+        choices=("anthropic", "openai"),
+        help=f"LLM API protocol (default: {DEFAULT_API_PROTOCOL})",
+    )
+    parser.add_argument(
+        "--api_timeout",
+        type=int,
+        default=int(os.getenv("CHATSR_LLM_API_TIMEOUT", str(DEFAULT_API_TIMEOUT))),
+        help=f"LLM API request timeout seconds (default: {DEFAULT_API_TIMEOUT})",
+    )
+    parser.add_argument(
+        "--api_version",
+        type=str,
+        default=os.getenv("CHATSR_LLM_API_VERSION", DEFAULT_API_VERSION),
+        help=f"Anthropic-compatible API version header (default: {DEFAULT_API_VERSION})",
+    )
+    # -------- Docling PDF config --------
     parser.add_argument(
         "--docling_use_ocr",
         dest="docling_use_ocr",
@@ -263,6 +302,10 @@ def build_runtime_config(args) -> ApiRuntimeConfig:
     # 控制分层检索的各个环节参数
     # ============================================================
     retrieval_strategy: Dict[str, Any] = default_retrieval_strategy()
+    gen_model_type = str(args.gen_model_type or DEFAULT_GENERATE_MODEL_TYPE).strip().lower()
+    gen_model_name = args.gen_model_name
+    if gen_model_type in API_GENERATE_MODEL_TYPES and gen_model_name == DEFAULT_GENERATE_MODEL_NAME:
+        gen_model_name = os.getenv("CHATSR_LLM_MODEL") or os.getenv("DEEPSEEK_MODEL") or DEFAULT_API_MODEL_NAME
 
     # ============================================================
     # 构建并返回配置对象
@@ -291,8 +334,8 @@ def build_runtime_config(args) -> ApiRuntimeConfig:
         # -------- 模型初始化参数 --------
         model_init_kwargs={
             # 模型类型与名称
-            "generate_model_type": args.gen_model_type,
-            "generate_model_name_or_path": args.gen_model_name,
+            "generate_model_type": gen_model_type,
+            "generate_model_name_or_path": gen_model_name,
             "lora_model_name_or_path": args.lora_model,
 
             # 语料配置
@@ -320,6 +363,11 @@ def build_runtime_config(args) -> ApiRuntimeConfig:
 
             # Ollama 配置
             "ollama_host": args.ollama_host,
+            "api_base_url": getattr(args, "api_base_url", DEFAULT_API_BASE_URL),
+            "api_key": getattr(args, "api_key", None),
+            "api_protocol": getattr(args, "api_protocol", DEFAULT_API_PROTOCOL),
+            "api_timeout": getattr(args, "api_timeout", DEFAULT_API_TIMEOUT),
+            "api_version": getattr(args, "api_version", DEFAULT_API_VERSION),
 
             # Docling 配置
             "docling_use_ocr": args.docling_use_ocr,

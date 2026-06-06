@@ -12,6 +12,13 @@ from loguru import logger
 from app.core.docling_extractor import create_docling_extractor
 from app.core.hierarchical_retriever import HierarchicalChromaRetriever
 from app.core.rag_defaults import (
+    API_GENERATE_MODEL_TYPES,
+    API_KEY_ENV_NAMES,
+    DEFAULT_API_BASE_URL,
+    DEFAULT_API_MODEL_NAME,
+    DEFAULT_API_PROTOCOL,
+    DEFAULT_API_TIMEOUT,
+    DEFAULT_API_VERSION,
     DEFAULT_CHUNK_OVERLAP,
     DEFAULT_CHUNK_SIZE,
     DEFAULT_CONTEXT_LEN,
@@ -21,7 +28,6 @@ from app.core.rag_defaults import (
     DEFAULT_HISTORY_SUMMARY_TURNS,
     DEFAULT_MAX_NEW_TOKENS,
     DEFAULT_OLLAMA_HOST,
-    DEFAULT_PARENT_RERANK_TOP_K,
     DEFAULT_RERANK_MODEL_NAME,
     DEFAULT_SUMMARY_MAX_NEW_TOKENS,
     DEFAULT_TEMPERATURE,
@@ -34,7 +40,6 @@ from app.core.rag_common import (
 )
 from app.core.rag_generation_model import init_generation_model, resolve_default_device
 from app.core.rag_history_manager import RagHistoryManager
-from app.core.rag_hash_utils import resolve_embedding_dir as resolve_embedding_dir_from_files
 from app.core.rag_prompts import PROMPT_TEMPLATE
 from app.core.rag_query_expander import RagQueryExpander
 from app.services.rag_document_service import RagDocumentService
@@ -59,7 +64,6 @@ class Rag:
             chunk_overlap: int = DEFAULT_CHUNK_OVERLAP,
             rerank_model_name_or_path: Optional[str] = None,
             enable_history: bool = True,
-            rerank_top_k: int = DEFAULT_PARENT_RERANK_TOP_K,
             ollama_host: Optional[str] = DEFAULT_OLLAMA_HOST,
             history_summary: str = "",
             history_summary_turns: int = DEFAULT_HISTORY_SUMMARY_TURNS,
@@ -70,6 +74,11 @@ class Rag:
             chroma_persist_directory: str = "./corpus_embs/chroma",
             generation_limits: Optional[Dict[str, Any]] = None,
             retrieval_strategy: Optional[Dict[str, Any]] = None,
+            api_base_url: Optional[str] = None,
+            api_key: Optional[str] = None,
+            api_protocol: Optional[str] = None,
+            api_timeout: int = DEFAULT_API_TIMEOUT,
+            api_version: Optional[str] = None,
     ):
         """初始化 RAG 模型
 
@@ -86,7 +95,6 @@ class Rag:
             chunk_overlap: 分块重叠，默认值来自 rag_defaults.py
             rerank_model_name_or_path: 重排模型名称或路径，默认为本地 models/bge-reranker-base
             enable_history: 是否启用历史记录，默认为 True
-            rerank_top_k: 层次检索和重排后保留的 top-k 参考
             ollama_host: Ollama 主机地址，默认值来自 rag_defaults.py
             history_summary: 当前会话的压缩记忆
             docling_use_ocr: 是否在 Docling 提取器中启用 OCR
@@ -112,9 +120,10 @@ class Rag:
         self._init_generator(
             generate_model_type, generate_model_name_or_path,
             lora_model_name_or_path, ollama_host, int8, int4,
+            api_base_url, api_key, api_protocol, api_timeout, api_version,
         )
         self._init_config(
-            enable_history, rerank_top_k, history_summary,
+            enable_history, history_summary,
             history_summary_turns, history_keep_last_turns,
             query_expansion, generation_limits, retrieval_strategy,
         )
@@ -145,12 +154,46 @@ class Rag:
         )
         logger.info(f"Using hierarchical Chroma backend: {self.chroma_persist_directory}")
 
-    def _init_generator(self, gen_model_type, gen_model_name_or_path, lora_name, ollama_host, int8, int4):
-        if gen_model_type != "ollama":
-            raise ValueError("当前版本仅支持 gen_model_type='ollama'")
-        self.use_ollama = gen_model_type == "ollama"
+    @staticmethod
+    def _resolve_api_key(explicit_key: Optional[str]) -> str:
+        if explicit_key:
+            return explicit_key
+        for env_name in API_KEY_ENV_NAMES:
+            value = os.getenv(env_name)
+            if value:
+                return value
+        return ""
+
+    @staticmethod
+    def _is_api_model_type(gen_model_type: str) -> bool:
+        return (gen_model_type or "").strip().lower() in API_GENERATE_MODEL_TYPES
+
+    def _init_generator(
+        self,
+        gen_model_type,
+        gen_model_name_or_path,
+        lora_name,
+        ollama_host,
+        int8,
+        int4,
+        api_base_url,
+        api_key,
+        api_protocol,
+        api_timeout,
+        api_version,
+    ):
+        normalized_type = (gen_model_type or DEFAULT_GENERATE_MODEL_TYPE).strip().lower()
+        self.use_ollama = normalized_type == "ollama"
+        self.use_api = self._is_api_model_type(normalized_type)
+        self.generate_model_type = normalized_type
         self.ollama_host: Optional[str] = None
         self.ollama_model: Optional[str] = None
+        self.api_base_url: Optional[str] = None
+        self.api_key: str = ""
+        self.api_model: Optional[str] = None
+        self.api_protocol: str = DEFAULT_API_PROTOCOL
+        self.api_timeout: int = DEFAULT_API_TIMEOUT
+        self.api_version: str = DEFAULT_API_VERSION
         self.gen_model: Any = None
         self.tokenizer: Any = None
 
@@ -158,9 +201,35 @@ class Rag:
             self.ollama_host = ollama_host or os.getenv("OLLAMA_HOST", DEFAULT_OLLAMA_HOST)
             self.ollama_model = gen_model_name_or_path
             logger.info(f"Using Ollama model: {self.ollama_model} at {self.ollama_host}")
+        elif self.use_api:
+            configured_model = str(gen_model_name_or_path or "").strip()
+            if not configured_model or configured_model == DEFAULT_GENERATE_MODEL_NAME:
+                configured_model = (
+                    os.getenv("CHATSR_LLM_MODEL")
+                    or os.getenv("DEEPSEEK_MODEL")
+                    or DEFAULT_API_MODEL_NAME
+                )
+            self.api_model = configured_model
+            self.api_protocol = (api_protocol or os.getenv("CHATSR_LLM_API_PROTOCOL") or DEFAULT_API_PROTOCOL).strip().lower()
+            self.api_base_url = (
+                api_base_url
+                or os.getenv("CHATSR_LLM_API_BASE_URL")
+                or os.getenv("DEEPSEEK_BASE_URL")
+                or os.getenv("OPENAI_BASE_URL")
+                or DEFAULT_API_BASE_URL
+            )
+            self.api_key = self._resolve_api_key(api_key)
+            self.api_timeout = int(api_timeout or DEFAULT_API_TIMEOUT)
+            self.api_version = api_version or os.getenv("CHATSR_LLM_API_VERSION") or DEFAULT_API_VERSION
+            if not self.api_key:
+                names = ", ".join(API_KEY_ENV_NAMES)
+                raise ValueError(f"API generation selected but no API key was provided. Set one of: {names}")
+            logger.info(
+                f"Using API model: {self.api_model} via {self.api_protocol} endpoint {self.api_base_url}"
+            )
         else:
             self.gen_model, self.tokenizer = self._init_gen_model(
-                gen_model_type, gen_model_name_or_path,
+                normalized_type, gen_model_name_or_path,
                 peft_name=lora_name, int8=int8, int4=int4,
             )
 
@@ -185,7 +254,6 @@ class Rag:
     def _init_config(
         self,
         enable_history,
-        rerank_top_k,
         history_summary,
         history_summary_turns,
         history_keep_last_turns,
@@ -195,7 +263,6 @@ class Rag:
     ):
         self.history: List[List[str]] = []
         self.enable_history = enable_history
-        self.rerank_top_k = rerank_top_k
         self.history_summary = history_summary or ""
         resolved_summary_turns = DEFAULT_HISTORY_SUMMARY_TURNS if history_summary_turns is None else history_summary_turns
         resolved_keep_turns = DEFAULT_HISTORY_KEEP_TURNS if history_keep_last_turns is None else history_keep_last_turns
@@ -213,6 +280,8 @@ class Rag:
         """
         if self.use_ollama:
             return f"Hierarchical retriever: {self.hierarchical_retriever}, Generate model: Ollama({self.ollama_model})"
+        if self.use_api:
+            return f"Hierarchical retriever: {self.hierarchical_retriever}, Generate model: API({self.api_model})"
         return f"Hierarchical retriever: {self.hierarchical_retriever}, Generate model: {self.gen_model}"
 
 
@@ -269,7 +338,7 @@ class Rag:
                 messages.append({'role': 'assistant', 'content': conv[1]})
 
         # 如果使用 Ollama，直接返回消息
-        if self.use_ollama:
+        if self.use_ollama or self.use_api:
             return messages
 
         input_ids = self.tokenizer.apply_chat_template(
@@ -398,8 +467,8 @@ class Rag:
         Returns:
             嵌入目录路径
         """
-        target_files = self.corpus_files if corpus_files is None else corpus_files
-        return resolve_embedding_dir_from_files(self.save_corpus_emb_dir, target_files or [])
+        # Only the active Chroma directory is supported; legacy corpus-hash snapshots are ignored.
+        return self.chroma_persist_directory
 
 
     def predict_stream(

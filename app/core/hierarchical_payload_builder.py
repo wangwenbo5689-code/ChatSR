@@ -1,8 +1,15 @@
 import os
+import re
 from collections import defaultdict
 from typing import Any, Dict, List
 
-from app.core.section_filters import is_noise_section_metadata
+from app.core.section_filters import (
+    is_noise_section_metadata,
+    normalize_section_title as normalize_filter_section_title,
+)
+
+
+ABSTRACT_TITLES = {"abstract", "\u6458\u8981"}
 
 
 def _split_section_hierarchy(meta: Dict[str, Any]) -> List[str]:
@@ -64,6 +71,69 @@ def _leaf_title_from_section_key(section_key: str) -> str:
     if not section_key:
         return "Document"
     return section_key.split(" > ")[-1].strip() or "Document"
+
+
+def _build_element_retrieval_text(text: str, section_title: str) -> str:
+    body = str(text or "").strip()
+    title = str(section_title or "").strip()
+    if not title or title.lower() == "document":
+        return body
+    if body.lower().startswith(title.lower()):
+        return body
+    return f"Section: {title}\n\n{body}".strip()
+
+
+def _is_abstract_title(value: Any) -> bool:
+    normalized = normalize_filter_section_title(value)
+    if not normalized:
+        return False
+    return any(
+        normalized == title
+        or normalized.startswith(f"{title} ")
+        or normalized.startswith(f"{title}:")
+        for title in ABSTRACT_TITLES
+    )
+
+
+def _is_abstract_metadata(meta: Dict[str, Any]) -> bool:
+    if _is_abstract_title(meta.get("section_title")):
+        return True
+    return any(_is_abstract_title(part) for part in _split_section_hierarchy(meta))
+
+
+def _text_starts_with_abstract_label(text: str) -> bool:
+    prefix = str(text or "").strip()[:80].lower()
+    return (
+        prefix == "abstract"
+        or prefix.startswith("abstract\n")
+        or prefix.startswith("abstract:")
+        or prefix.startswith("abstract.")
+        or prefix.startswith("abstract -")
+        or prefix.startswith("abstract \u2013")
+        or prefix.startswith("abstract \u2014")
+        or prefix.startswith("\u6458\u8981")
+    )
+
+
+def _is_abstract_item(item: Dict[str, Any]) -> bool:
+    meta = item.get("metadata") or {}
+    text = str(item.get("text") or "")
+    return _is_abstract_metadata(meta) or _text_starts_with_abstract_label(text)
+
+
+def _strip_abstract_heading(text: str) -> str:
+    body = str(text or "").strip()
+    stripped = re.sub(r"^(abstract|\u6458\u8981)\s*[:.\-]?\s*", "", body, flags=re.IGNORECASE).strip()
+    return stripped or body
+
+
+def _extract_abstract_text(normalized_items: List[Dict[str, Any]]) -> str:
+    pieces = [
+        _strip_abstract_heading(item["text"])
+        for item in normalized_items
+        if _is_abstract_item(item)
+    ]
+    return "\n\n".join(piece for piece in pieces if piece).strip()
 
 
 def _coerce_page(value: Any) -> int:
@@ -195,23 +265,21 @@ def _collect_sections(
     return remapped_items, section_groups, effective_section_order
 
 
-def _build_paper_document(child_items: List[Dict[str, Any]]) -> str:
-    """构建论文文档
-
-    Args:
-        child_items: 子项目列表
-
-    Returns:
-        str: 论文文档内容
-    """
-    return "\n\n".join(item["text"] for item in child_items).strip()
+def _build_paper_document(file_name: str, abstract_text: str, section_names: List[str]) -> str:
+    lines = [f"Title: {file_name}"]
+    if abstract_text:
+        lines.extend(["", "Abstract:", abstract_text])
+    if section_names:
+        lines.extend(["", "Sections:"])
+        lines.extend(f"- {_leaf_title_from_section_key(name)}" for name in section_names)
+    return "\n".join(lines).strip() or file_name
 
 
 def _build_paper_payload(
     doc_hash: str,
     doc_file: str,
     paper_id: str,
-    paper_doc: str,
+    abstract_text: str,
     page_count: int,
     section_names: List[str],
     child_items: List[Dict[str, Any]],
@@ -222,7 +290,7 @@ def _build_paper_payload(
         doc_hash: 文档哈希
         doc_file: 文档文件路径
         paper_id: 论文 ID
-        paper_doc: 论文文档内容
+        abstract_text: 专门抽取的摘要文本
         page_count: 页数
         section_names: 章节名称列表
         child_items: 子项目列表
@@ -231,11 +299,16 @@ def _build_paper_payload(
         Dict[str, Any]: 论文 payload
     """
     file_name = os.path.basename(doc_file)
+    paper_doc = _build_paper_document(
+        file_name=file_name,
+        abstract_text=abstract_text,
+        section_names=section_names,
+    )
     metadata = {
         "level": "paper",
         "paper_id": paper_id,
         "title": file_name,
-        "abstract": (paper_doc or file_name)[:1000],
+        "abstract": abstract_text,
         "pdf_path": file_name if os.path.basename(os.path.dirname(doc_file)).startswith("chatsr_upload_") else doc_file,
         "corpus_name": "default",
         "doc_hash": doc_hash,
@@ -247,7 +320,7 @@ def _build_paper_payload(
         metadata["page_count"] = page_count
     return {
         "ids": [paper_id],
-        "documents": [paper_doc or file_name],
+        "documents": [paper_doc],
         "metadatas": [metadata],
     }
 
@@ -281,19 +354,25 @@ def _build_section_payloads(
         section_doc = "\n\n".join(item["text"] for item in section_items).strip()
         section_docs.append(section_doc)
         pages = [_coerce_page(item["metadata"].get("page")) for item in section_items]
+        section_title = _leaf_title_from_section_key(section_name)
+        is_noise_section = is_noise_section_metadata({
+            "section_title": section_title,
+            "section_hierarchy": section_name,
+        })
         section_meta = {
             "level": "section",
             "section_id": section_ids[idx],
             "parent_id": paper_id,
             "paper_id": paper_id,
             "title": paper_title,
-            "section_title": _leaf_title_from_section_key(section_name),
+            "section_title": section_title,
             "section_hierarchy": section_name,
             "section_number": str(idx + 1),
             "start_page": min(pages) if pages else 1,
             "end_page": max(pages) if pages else 1,
             "chunk_count": len(section_items),
             "doc_hash": doc_hash,
+            "is_noise_section": is_noise_section,
         }
         section_metas.append(section_meta)
 
@@ -335,6 +414,11 @@ def _build_element_payloads(
         text = item["text"]
         meta = item["metadata"]
         section_key = _section_key_from_meta(meta)
+        section_title = _leaf_title_from_section_key(section_key)
+        is_noise_section = is_noise_section_metadata({
+            "section_title": section_title,
+            "section_hierarchy": section_key,
+        })
         section_idx = section_index_map.get(section_key, -1)
         section_id = f"{paper_id}_sec_{section_idx}" if section_idx >= 0 else ""
         per_section_position[section_key] += 1
@@ -347,7 +431,7 @@ def _build_element_payloads(
             "paper_id": paper_id,
             "paper_title": paper_title,
             "section_id": section_id,
-            "section_title": _normalize_section_title(meta),
+            "section_title": section_title,
             "section_hierarchy": section_key,
             "element_type": str(meta.get("source_type") or "text"),
             "position": position_in_section,
@@ -355,9 +439,10 @@ def _build_element_payloads(
             "chunk_index": _as_int(meta.get("chunk_index"), global_idx),
             "doc_hash": doc_hash,
             "text_content": text,
+            "is_noise_section": is_noise_section,
         }
         element_ids.append(element_id)
-        element_docs.append(text)
+        element_docs.append(_build_element_retrieval_text(text, section_title))
         element_metas.append(element_meta)
 
     return {
@@ -385,14 +470,14 @@ def build_hierarchical_document_payloads(
     normalized_items = normalize_chunk_items(chunk_items=chunk_items, doc_hash=doc_hash)
     paper_id = f"{doc_hash}_paper"
     paper_title = os.path.basename(doc_file)
+    abstract_text = _extract_abstract_text(normalized_items)
     body_items = [
         item for item in normalized_items
-        if not _is_reference_section(item["metadata"])
+        if not _is_reference_section(item["metadata"]) and not _is_abstract_item(item)
     ]
-    if not body_items:
+    if not body_items and not abstract_text:
         body_items = normalized_items
     child_items, section_groups, section_order = _collect_sections(body_items)
-    paper_doc = _build_paper_document(child_items=child_items)
     page_count = max((_coerce_page(item["metadata"].get("page")) for item in normalized_items), default=0)
     section_payload = _build_section_payloads(
         doc_hash=doc_hash,
@@ -414,7 +499,7 @@ def build_hierarchical_document_payloads(
             doc_hash=doc_hash,
             doc_file=doc_file,
             paper_id=paper_id,
-            paper_doc=paper_doc,
+            abstract_text=abstract_text,
             page_count=page_count,
             section_names=section_payload["names"],
             child_items=child_items,

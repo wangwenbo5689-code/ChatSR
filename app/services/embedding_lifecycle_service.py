@@ -52,20 +52,18 @@ class EmbeddingLifecycleService:
 
     def resolve_local_embedding_state(self, model) -> dict:
         corpus_files = self.corpus_service.list_local_corpus_files()
-        snapshot_dir = model.resolve_embedding_dir(corpus_files)
-        snapshot_exists = bool(snapshot_dir and os.path.isdir(snapshot_dir))
         chroma_dir = getattr(model, "chroma_persist_directory", "")
         chroma_exists = self._chroma_store_exists(chroma_dir)
         chunk_count = self._chunk_count(model)
         persisted_index_exists = chroma_exists
-        embedding_dir = snapshot_dir if snapshot_exists else (chroma_dir if persisted_index_exists else snapshot_dir)
-        embedding_exists = snapshot_exists or persisted_index_exists
+        embedding_dir = chroma_dir
+        embedding_exists = persisted_index_exists
         return {
             "corpus_files": corpus_files,
             "embedding_dir": embedding_dir,
             "embedding_exists": embedding_exists,
-            "snapshot_dir": snapshot_dir,
-            "snapshot_exists": snapshot_exists,
+            "snapshot_dir": None,
+            "snapshot_exists": False,
             "chroma_persist_directory": chroma_dir,
             "chroma_store_exists": chroma_exists,
             "persisted_index_exists": persisted_index_exists,

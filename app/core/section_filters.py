@@ -33,7 +33,6 @@ NOISE_SECTION_KEYWORDS = {
     "supplementary material",
     "supplementary information",
     "supplemental material",
-    "abstract",
     "参考文献",
     "致谢",
     "作者贡献",

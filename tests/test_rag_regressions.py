@@ -41,6 +41,20 @@ class DummyEmbeddingFunction:
         return [[0.1, 0.2, 0.3] for _ in input]
 
 
+class FakeApiResponse:
+    def __init__(self, lines):
+        self.lines = lines
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_args):
+        return False
+
+    def __iter__(self):
+        return iter(self.lines)
+
+
 class RagRegressionTests(unittest.TestCase):
     def test_generation_window_clamps_when_max_new_tokens_exceeds_context(self):
         safe_new_tokens, max_src_len = RagGenerationService._resolve_generation_window(
@@ -68,6 +82,39 @@ class RagRegressionTests(unittest.TestCase):
         self.assertEqual(chunks[-1]["history"][-1][0], "问题")
         self.assertTrue(chunks[-1]["history"][-1][1].startswith("你好"))
         self.assertIn("回答引用内容", chunks[-1]["history"][-1][1])
+
+    @patch("urllib.request.urlopen")
+    def test_stream_api_reads_anthropic_compatible_sse(self, urlopen_patch):
+        rag = Rag.__new__(Rag)
+        rag.use_ollama = False
+        rag.use_api = True
+        rag.api_base_url = "https://api.example.com/anthropic"
+        rag.api_key = "test-key"
+        rag.api_model = "deepseek-v4-pro[1m]"
+        rag.api_protocol = "anthropic"
+        rag.api_timeout = 5
+        rag.api_version = "2023-06-01"
+        rag._get_chat_input = lambda history=None, history_summary=None: [
+            {"role": "system", "content": "system prompt"},
+            {"role": "user", "content": "hello"},
+        ]
+        urlopen_patch.return_value = FakeApiResponse([
+            b"event: content_block_delta\n",
+            'data: {"type":"content_block_delta","delta":{"type":"text_delta","text":"你"}}\n'.encode("utf-8"),
+            'data: {"type":"content_block_delta","delta":{"type":"text_delta","text":"好"}}\n'.encode("utf-8"),
+            b"data: [DONE]\n",
+        ])
+
+        gen = RagGenerationService(rag)
+        chunks = list(gen._stream_api(32, 0.0, history=[], history_summary=""))
+
+        self.assertEqual(chunks, ["你", "好"])
+        request = urlopen_patch.call_args.args[0]
+        self.assertEqual(request.full_url, "https://api.example.com/anthropic/v1/messages")
+        payload = json.loads(request.data.decode("utf-8"))
+        self.assertEqual(payload["model"], "deepseek-v4-pro[1m]")
+        self.assertEqual(payload["system"], "system prompt")
+        self.assertEqual(payload["messages"], [{"role": "user", "content": "hello"}])
 
     def test_document_overview_without_selected_doc_prompts_without_retrieval(self):
         rag = Rag.__new__(Rag)
@@ -185,26 +232,28 @@ class RagRegressionTests(unittest.TestCase):
         rag.hierarchical_retriever = MagicMock()
         rag.corpus_files = ["/tmp/demo.pdf"]
         rag.save_corpus_emb_dir = "/tmp/cache"
+        rag.chroma_persist_directory = "/tmp/cache/chroma"
         rag._index_service = MagicMock()
-        rag.resolve_embedding_dir = lambda corpus_files=None: "/tmp/cache/abc123"
 
         save_dir = rag.save_corpus_emb()
 
-        self.assertEqual(save_dir, "/tmp/cache/abc123")
-        rag.hierarchical_retriever.save_persist_directory.assert_called_once_with("/tmp/cache/abc123")
-        rag._index_service.switch_persist_directory.assert_called_once_with("/tmp/cache/abc123")
+        self.assertEqual(save_dir, "/tmp/cache/chroma")
+        rag.hierarchical_retriever.save_persist_directory.assert_called_once_with("/tmp/cache/chroma")
+        rag._index_service.switch_persist_directory.assert_called_once_with("/tmp/cache/chroma")
 
         rag.hierarchical_retriever.load_persist_directory.reset_mock()
         rag._index_service.switch_persist_directory.reset_mock()
 
-        rag.load_corpus_emb("/tmp/cache/loaded")
+        rag.load_corpus_emb("/tmp/cache/chroma")
 
-        rag.hierarchical_retriever.load_persist_directory.assert_called_once_with("/tmp/cache/loaded")
-        rag._index_service.switch_persist_directory.assert_called_once_with("/tmp/cache/loaded")
+        rag.hierarchical_retriever.load_persist_directory.assert_called_once_with("/tmp/cache/chroma")
+        rag._index_service.switch_persist_directory.assert_called_once_with("/tmp/cache/chroma")
+
+        with self.assertRaises(ValueError):
+            rag.load_corpus_emb("/tmp/cache/old-snapshot")
 
     def test_get_reference_results_uses_hierarchical_main_path(self):
         rag = Rag.__new__(Rag)
-        rag.rerank_top_k = 2
         rag._expand_query = lambda query: [query]
         rag.query_expander = SimpleNamespace(classify_intent=lambda _query: "fact_qa")
         rag.hierarchical_retriever = MagicMock()
@@ -293,7 +342,6 @@ class RagRegressionTests(unittest.TestCase):
     @patch("app.services.rag_retrieval_service.file_md5_hex_32")
     def test_get_reference_results_passes_selected_doc_hashes(self, hash_patch):
         rag = Rag.__new__(Rag)
-        rag.rerank_top_k = 2
         rag._expand_query = lambda query: [query]
         rag.query_expander = SimpleNamespace(classify_intent=lambda _query: "fact_qa")
         rag.hierarchical_retriever = MagicMock()
@@ -340,14 +388,20 @@ class RagRegressionTests(unittest.TestCase):
         self.assertEqual(captured["intent"], "fact_qa")
         self.assertEqual(refs, [{"text": "命中A", "metadata": {"section_title": "Intro"}}])
 
-    def test_get_reference_results_reranks_multi_query_hits_with_count_and_section_score(self):
+    def test_get_reference_results_uses_english_sub_queries_for_fact_qa(self):
         rag = Rag.__new__(Rag)
-        rag.rerank_top_k = 2
-        rag._expand_query = lambda query: ["q1", "q2", "q3"]
-        rag.query_expander = SimpleNamespace(classify_intent=lambda _query: "fact_qa")
+        rag._expand_query = MagicMock(side_effect=AssertionError("fact_qa should use English rewrite queries"))
+        generate_summary = MagicMock(return_value="q1\nq2\nq3")
+
+        rag.query_expander = SimpleNamespace(
+            classify_intent=lambda _query: "fact_qa",
+            generate_summary=generate_summary,
+        )
         rag.hierarchical_retriever = MagicMock()
 
         retrieval = RagRetrievalService(rag)
+        retrieval.strategy = {"dynamic_selection": {"fact_qa": {"keep_ratio": 0.0, "min_keep": 2, "max_keep": 6}}}
+        captured_queries = []
 
         def make_item(item_id, score):
             return FusedResult(
@@ -364,6 +418,7 @@ class RagRegressionTests(unittest.TestCase):
 
         def fake_retrieve_child_candidates(query, topn, allowed_doc_hashes=None, intent=None):
             _ = topn, allowed_doc_hashes, intent
+            captured_queries.append(query)
             if query == "q1":
                 return [make_item("A", 0.9), make_item("B", 0.8), make_item("C", 0.7)]
             if query == "q2":
@@ -374,6 +429,8 @@ class RagRegressionTests(unittest.TestCase):
 
         def fake_build_context(final, query):
             captured_final["ids"] = [item.result.id for item in final]
+            captured_final["scores"] = [item.fused_score for item in final]
+            captured_final["source_scores"] = [item.source_scores for item in final]
             return {
                 "blocks": [item.result.content for item in final],
                 "citations": [item.result.metadata for item in final],
@@ -385,20 +442,132 @@ class RagRegressionTests(unittest.TestCase):
         refs = retrieval.get_reference_results("残差连接")
 
         self.assertEqual(captured_final["ids"][0], "A")
+        self.assertEqual(captured_queries, ["q1", "q2", "q3"])
+        generate_summary.assert_called_once()
+        self.assertIn("Return at most 5 sub-queries", generate_summary.call_args.args[0])
+        rag._expand_query.assert_not_called()
+        self.assertIn("cross_query_rrf", captured_final["source_scores"][0])
+        self.assertGreater(captured_final["scores"][0], captured_final["scores"][1])
         self.assertEqual(refs[0], {"text": "A", "metadata": {"section_title": "A"}})
 
-    def test_try_hierarchical_retrieve_prefers_structured_blocks_over_display_context(self):
+    def test_fact_qa_english_sub_queries_keep_at_most_five_queries(self):
         rag = Rag.__new__(Rag)
-        rag.rerank_top_k = 2
+        generate_summary = MagicMock(return_value="\n".join(
+            f"{idx + 1}. English query: subquery {idx} rewritten"
+            for idx in range(7)
+        ))
+        rag.query_expander = SimpleNamespace(generate_summary=generate_summary)
+        retrieval = RagRetrievalService(rag)
+
+        queries = retrieval._build_fact_english_queries("ignored")
+
+        self.assertEqual(len(queries), 5)
+        self.assertEqual(queries[0], "subquery 0 rewritten")
+        self.assertTrue(all("English query" not in query for query in queries))
+        generate_summary.assert_called_once()
+        self.assertIn("Return at most 5 sub-queries", generate_summary.call_args.args[0])
+
+    def test_general_overview_english_rewrite_keeps_at_most_four_variants(self):
+        rag = Rag.__new__(Rag)
+        generate_summary = MagicMock(return_value="\n".join(
+            f"{idx + 1}. English retrieval query: overview rewrite {idx}"
+            for idx in range(6)
+        ))
+        rag.query_expander = SimpleNamespace(generate_summary=generate_summary)
+        retrieval = RagRetrievalService(rag)
+
+        queries = retrieval._build_general_overview_english_queries("ignored")
+
+        self.assertEqual(len(queries), 4)
+        self.assertEqual(queries[0], "overview rewrite 0")
+        self.assertTrue(all("English retrieval query" not in query for query in queries))
+        generate_summary.assert_called_once()
+        self.assertIn("Return at most 4 rewritten queries", generate_summary.call_args.args[0])
+        self.assertIn("not a separate sub-question", generate_summary.call_args.args[0])
+
+    def test_general_overview_uses_english_rewrite_queries_for_parent_retrieval(self):
+        rag = Rag.__new__(Rag)
+        rag._expand_query = MagicMock(side_effect=AssertionError("general_overview should use English rewrite queries"))
+        generate_summary = MagicMock(return_value="\n".join(
+            f"overview rewrite {idx}"
+            for idx in range(5)
+        ))
+
+        rag.query_expander = SimpleNamespace(
+            classify_intent=lambda _query: "general_overview",
+            generate_summary=generate_summary,
+        )
         rag.hierarchical_retriever = MagicMock()
-        rag.hierarchical_retriever.retrieve.return_value = {
+
+        retrieval = RagRetrievalService(rag)
+        captured_queries = []
+
+        def make_item(query):
+            return FusedResult(
+                result=RetrievalResult(
+                    id=query,
+                    content=query,
+                    score=1.0,
+                    level="section",
+                    metadata={"section_title": query},
+                ),
+                fused_score=1.0,
+                source_scores={},
+            )
+
+        def fake_retrieve_parent_candidates(query, topn, allowed_doc_hashes=None, intent=None):
+            _ = topn, allowed_doc_hashes, intent
+            captured_queries.append(query)
+            return [make_item(query)]
+
+        rag.hierarchical_retriever.retrieve_parent_candidates.side_effect = fake_retrieve_parent_candidates
+        rag.hierarchical_retriever.build_context_from_parents.return_value = {
+            "blocks": ["overview topic 0"],
+            "citations": [{"section_title": "overview topic 0"}],
+        }
+
+        refs = retrieval.get_reference_results("ignored", intent="general_overview")
+
+        self.assertEqual(captured_queries, [
+            "overview rewrite 0",
+            "overview rewrite 1",
+            "overview rewrite 2",
+            "overview rewrite 3",
+        ])
+        generate_summary.assert_called_once()
+        self.assertIn("Return at most 4 rewritten queries", generate_summary.call_args.args[0])
+        self.assertIn("not a separate sub-question", generate_summary.call_args.args[0])
+        rag._expand_query.assert_not_called()
+        self.assertEqual(refs, [{"text": "overview topic 0", "metadata": {"section_title": "overview topic 0"}}])
+
+    def test_get_reference_results_prefers_structured_blocks_over_display_context(self):
+        rag = Rag.__new__(Rag)
+        rag._expand_query = lambda query: [query]
+        rag.query_expander = SimpleNamespace(classify_intent=lambda _query: "general_overview")
+        rag.hierarchical_retriever = MagicMock()
+
+        def make_item(item_id, score):
+            return FusedResult(
+                result=RetrievalResult(
+                    id=item_id,
+                    content=item_id,
+                    score=score,
+                    level="section",
+                    metadata={"section_title": item_id},
+                ),
+                fused_score=score,
+                source_scores={},
+            )
+
+        rag.hierarchical_retriever.retrieve_parent_candidates.return_value = [make_item("sec-a", 1.0)]
+        rag.hierarchical_retriever.build_context_from_parents.return_value = {
             "context": "用户问题: q\n\n相关文献内容:\n" + "=" * 50 + "\n包装文本",
             "blocks": ["块A", "块B"],
         }
 
         retrieval = RagRetrievalService(rag)
 
-        refs = retrieval.try_hierarchical_retrieve("残差连接")
+        refs = retrieval.get_reference_results("残差连接")
 
         self.assertEqual(refs, [{"text": "块A", "metadata": {}}, {"text": "块B", "metadata": {}}])
 
@@ -697,26 +866,28 @@ class SessionStoreRefactorTests(unittest.TestCase):
 
 
 class EmbeddingLifecycleServiceRefactorTests(unittest.TestCase):
-    def test_resolve_local_embedding_state_reuses_single_path_rule(self):
+    def test_resolve_local_embedding_state_uses_active_chroma_only(self):
         corpus_service = MagicMock()
         corpus_service.list_local_corpus_files.return_value = ["/tmp/a.pdf", "/tmp/b.pdf"]
         model = MagicMock()
-        model.resolve_embedding_dir.return_value = "/tmp/cache/abc123"
+        model.chroma_persist_directory = "/tmp/cache/chroma"
+        model.hierarchical_retriever.get_index_counts.return_value = {"element": 2}
 
         service = EmbeddingLifecycleService(corpus_service)
-        with patch("app.services.embedding_lifecycle_service.os.path.isdir", return_value=True):
+        with patch.object(service, "_chroma_store_exists", return_value=True):
             state = service.resolve_local_embedding_state(model)
 
         self.assertEqual(state["corpus_files"], ["/tmp/a.pdf", "/tmp/b.pdf"])
-        self.assertEqual(state["embedding_dir"], "/tmp/cache/abc123")
+        self.assertEqual(state["embedding_dir"], "/tmp/cache/chroma")
         self.assertTrue(state["embedding_exists"])
-        model.resolve_embedding_dir.assert_called_once_with(["/tmp/a.pdf", "/tmp/b.pdf"])
+        self.assertFalse(state["snapshot_exists"])
+        self.assertIsNone(state["snapshot_dir"])
+        model.resolve_embedding_dir.assert_not_called()
 
     def test_resolve_local_embedding_state_accepts_persisted_chroma_store(self):
         corpus_service = MagicMock()
         corpus_service.list_local_corpus_files.return_value = ["/tmp/a.pdf"]
         model = MagicMock()
-        model.resolve_embedding_dir.return_value = "/tmp/cache/missing"
         model.hierarchical_retriever.get_index_counts.return_value = {"element": 0}
 
         with tempfile.TemporaryDirectory() as tmp_dir:
@@ -740,14 +911,14 @@ class EmbeddingLifecycleServiceRefactorTests(unittest.TestCase):
         corpus_service = MagicMock()
         corpus_service.list_local_corpus_files.return_value = ["/tmp/a.pdf"]
         model = MagicMock()
-        model.resolve_embedding_dir.return_value = "/tmp/cache/abc123"
+        model.chroma_persist_directory = "/tmp/cache/chroma"
         model.hierarchical_retriever.get_index_counts.return_value = {"element": 1}
 
         service = EmbeddingLifecycleService(corpus_service)
-        with patch("app.services.embedding_lifecycle_service.os.path.isdir", return_value=True):
+        with patch.object(service, "_chroma_store_exists", return_value=True):
             service.bootstrap_local_corpus(model, MagicMock())
 
-        model.load_corpus_emb.assert_called_once_with("/tmp/cache/abc123")
+        model.load_corpus_emb.assert_called_once_with("/tmp/cache/chroma")
         model.add_corpus.assert_not_called()
 
     def test_save_embeddings_runs_under_same_lock_guard(self):
@@ -756,13 +927,13 @@ class EmbeddingLifecycleServiceRefactorTests(unittest.TestCase):
         model = MagicMock()
         model.hierarchical_retriever.has_indexed_content.return_value = True
         model.hierarchical_retriever.get_index_counts.return_value = {"element": 1}
-        model.save_corpus_emb.return_value = "/tmp/cache/abc123"
+        model.save_corpus_emb.return_value = "/tmp/cache/chroma"
         rag_lock = MagicMock()
 
         service = EmbeddingLifecycleService(corpus_service)
         payload = service.save_embeddings(model, rag_lock)
 
-        self.assertEqual(payload["embedding_dir"], "/tmp/cache/abc123")
+        self.assertEqual(payload["embedding_dir"], "/tmp/cache/chroma")
         self.assertEqual(payload["chunk_count"], 1)
         model.save_corpus_emb.assert_called_once()
         self.assertEqual(model.corpus_files, ["/tmp/a.pdf"])
@@ -819,7 +990,10 @@ class HierarchicalRetrieverRefactorTests(unittest.TestCase):
         self.assertNotIn("parent_id", payloads["paper"]["metadatas"][0])
         self.assertEqual(payloads["section"]["ids"], ["doc-1_paper_sec_0"])
         self.assertEqual(payloads["element"]["metadatas"][0]["section_id"], "doc-1_paper_sec_0")
-        self.assertEqual(payloads["element"]["documents"], ["attention residual block"])
+        self.assertEqual(payloads["element"]["documents"], ["Section: Intro\n\nattention residual block"])
+        self.assertEqual(payloads["element"]["metadatas"][0]["text_content"], "attention residual block")
+        self.assertFalse(payloads["section"]["metadatas"][0]["is_noise_section"])
+        self.assertFalse(payloads["element"]["metadatas"][0]["is_noise_section"])
         self.assertEqual(payloads["element"]["ids"], ["doc-1_paper_sec_0_elem_0"])
 
     def test_build_hierarchical_document_payloads_use_leaf_section_title(self):
@@ -840,6 +1014,24 @@ class HierarchicalRetrieverRefactorTests(unittest.TestCase):
         self.assertEqual(payloads["section"]["metadatas"][0]["section_title"], "Motivation")
         self.assertEqual(payloads["section"]["metadatas"][0]["section_hierarchy"], "Introduction > Motivation")
         self.assertEqual(payloads["element"]["metadatas"][0]["section_title"], "Motivation")
+
+    def test_build_hierarchical_document_payloads_marks_noise_sections(self):
+        payloads = build_hierarchical_document_payloads(
+            doc_hash="doc-1",
+            doc_file="/tmp/demo.pdf",
+            chunk_items=[{
+                "text": "all authors contributed equally",
+                "metadata": {
+                    "section_title": "Author Contributions",
+                    "section_hierarchy": "Author Contributions",
+                    "source_type": "text",
+                    "page": 9,
+                },
+            }],
+        )
+
+        self.assertTrue(payloads["section"]["metadatas"][0]["is_noise_section"])
+        self.assertTrue(payloads["element"]["metadatas"][0]["is_noise_section"])
 
 
 @unittest.skipIf(TestClient is None or create_app is None, "fastapi not installed")

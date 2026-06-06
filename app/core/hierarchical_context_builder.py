@@ -160,28 +160,13 @@ class ContextBuilder:
         """
         meta = result.metadata
         content = result.content
-        matched_children = meta.get("matched_children") or []
-        matched_text = ""
-        if matched_children:
-            matched_parts = []
-            for child in matched_children[:3]:
-                if not isinstance(child, dict):
-                    continue
-                child_content = (child.get("content") or "").strip()
-                if not child_content:
-                    continue
-                child_page = child.get("page", meta.get("start_page", "?"))
-                matched_parts.append(f"第{child_page}页: {child_content[:220]}")
-            if matched_parts:
-                matched_text = "\n【命中片段】\n" + "\n...\n".join(matched_parts)
         block_text = f"""
 【章节信息】
 论文: {meta.get('title') or meta.get('paper_id', '未知')}
 章节: {meta.get('section_title', '未知')}
 页码: 第{meta.get('start_page', '?')}页
-{matched_text}
 
-【内容】
+【章节完整内容】
 {content}
 """
         citation = {
@@ -205,7 +190,7 @@ class ContextBuilder:
             Dict[str, Any]: 元素块信息
         """
         meta = result.metadata
-        content = result.content
+        content = meta.get("text_content") or result.content
         element_type = meta.get("element_type", "text")
         paper_title = meta.get("title") or meta.get("paper_title") or meta.get("paper_id", "未知")
         element_type_cn = {
@@ -234,7 +219,9 @@ class ContextBuilder:
             "element_id": result.id,
             "paper_id": meta.get("paper_id", "未知"),
             "paper_title": meta.get("title") or meta.get("paper_title") or "未知文献",
+            "section_id": meta.get("section_id", ""),
             "section_title": meta.get("section_title", "未知"),
+            "position": meta.get("position", 0),
             "page": meta.get("page", 0),
             "element_type": element_type,
         } if include_citations else {}
@@ -251,7 +238,16 @@ class ContextBuilder:
         """
         metadata = result.metadata
         section_id = metadata.get("section_id")
-        position = metadata.get("position", 0)
+        try:
+            position = int(metadata.get("position", 0) or 0)
+        except (TypeError, ValueError):
+            position = 0
+        current_text = str(metadata.get("text_content") or result.content or "").strip()
+        element_type = str(metadata.get("element_type") or "").lower()
+        is_table = element_type == "table"
+        position_window = 4 if is_table else 5
+        context_limit = 1200 if is_table else 900
+        max_context_parts = 6 if is_table else 5
         if not self.element_collection:
             return "无"
         if not section_id:
@@ -261,45 +257,69 @@ class ContextBuilder:
             if prev_id:
                 try:
                     prev_result = self.element_collection.get(ids=[prev_id])
-                    if prev_result and prev_result.get("documents"):
-                        extended_parts.append(f"前文: {prev_result['documents'][0][:200]}")
+                    prev_metas = prev_result.get("metadatas") if prev_result else []
+                    prev_text = (prev_metas[0] or {}).get("text_content") if prev_metas else ""
+                    if prev_text:
+                        extended_parts.append(f"\u524d\u6587: {prev_text[:context_limit]}")
+                    elif prev_result and prev_result.get("documents"):
+                        extended_parts.append(f"前文: {prev_result['documents'][0][:context_limit]}")
                 except Exception as exc:
                     logger.debug(f"加载前一个元素失败: {exc}")
             if next_id:
                 try:
                     next_result = self.element_collection.get(ids=[next_id])
-                    if next_result and next_result.get("documents"):
-                        extended_parts.append(f"后文: {next_result['documents'][0][:200]}")
+                    next_metas = next_result.get("metadatas") if next_result else []
+                    next_text = (next_metas[0] or {}).get("text_content") if next_metas else ""
+                    if next_text:
+                        extended_parts.append(f"\u540e\u6587: {next_text[:context_limit]}")
+                    elif next_result and next_result.get("documents"):
+                        extended_parts.append(f"后文: {next_result['documents'][0][:context_limit]}")
                 except Exception as exc:
                     logger.debug(f"加载后一个元素失败: {exc}")
             return "\n".join(extended_parts) if extended_parts else "无"
         try:
-            results = self.element_collection.query(
-                query_texts=[query],
-                n_results=5, # 扩展上下文的固定结果数量
-                where={
-                    "$and": [
-                        {"section_id": section_id},
-                        {"position": {"$gte": max(0, position - 2)}},
-                        {"position": {"$lte": position + 2}},
-                    ]
-                },
-                include=['documents', 'metadatas', 'distances']
-            )
-            if results and results.get("documents"):
-                # 将嵌套列表展平为文档和元数据
-                documents_flat = [item for sublist in results.get("documents", []) for item in sublist]
-                metadatas_flat = [item for sublist in results.get("metadatas", []) for item in sublist]
+            where_filter = {
+                "$and": [
+                    {"section_id": section_id},
+                    {"position": {"$gte": max(0, position - position_window)}},
+                    {"position": {"$lte": position + position_window}},
+                ]
+            }
+            try:
+                results = self.element_collection.get(
+                    where=where_filter,
+                    include=["documents", "metadatas"],
+                )
+            except Exception:
+                results = self.element_collection.query(
+                    query_texts=[query],
+                    n_results=(position_window * 2) + 1,
+                    where=where_filter,
+                    include=["documents", "metadatas", "distances"],
+                )
 
-                positions = [meta.get("position", 0) for meta in metadatas_flat]
+            def flatten(value):
+                if not value:
+                    return []
+                if isinstance(value, list) and value and isinstance(value[0], list):
+                    return [item for sublist in value for item in sublist]
+                return value
+
+            if results and results.get("documents"):
+                documents_flat = flatten(results.get("documents"))
+                metadatas_flat = flatten(results.get("metadatas"))
+
+                positions = [(meta or {}).get("position", 0) for meta in metadatas_flat]
                 sorted_indices = sorted(range(len(positions)), key=lambda index: positions[index])
                 context_parts = []
                 for index in sorted_indices:
                     if index < len(documents_flat):
                         doc = documents_flat[index]
-                        if doc and doc != result.content:
-                            context_parts.append(doc[:200])
-                return "\n...\n".join(context_parts[:2])
+                        meta = metadatas_flat[index] if index < len(metadatas_flat) else {}
+                        original_text = str((meta or {}).get("text_content") or doc or "").strip()
+                        if original_text and original_text != current_text:
+                            context_parts.append(original_text[:context_limit])
+                return "\n...\n".join(context_parts[:max_context_parts])
         except Exception as exc:
             logger.warning(f"获取扩展上下文失败: {exc}")
         return "无"

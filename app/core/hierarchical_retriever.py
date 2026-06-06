@@ -5,6 +5,7 @@
 """
 
 from collections import defaultdict
+import hashlib
 import math
 import os
 import pickle
@@ -33,6 +34,7 @@ from app.core.section_filters import is_method_section_metadata, is_noise_sectio
 
 # 推荐配置（仅保留当前代码路径实际生效的参数）
 RECOMMENDED_CONFIG = default_hierarchical_retriever_config()
+BM25_CACHE_VERSION = 2
 
 class HybridRetriever:
     """混合检索器。
@@ -238,7 +240,7 @@ class HybridRetriever:
                 return 0.9, 1.15
             return 1.0, 1.2
         if intent == "general_overview" and level != RetrievalLevel.PAPER.value:
-            return 1.3, 0.9
+            return 1.2, 1.0
         if level == RetrievalLevel.PAPER.value:
             return 1.15, 0.95
         return 1.2, 0.9
@@ -360,11 +362,8 @@ class HybridRetriever:
         elements_by_section: Dict[str, List[Dict[str, Any]]],
     ) -> str:
         paper_meta = dict(paper_record.get("metadata") or {})
-        paper_doc = str(paper_record.get("document") or "").strip()
         title = str(paper_meta.get("title") or paper_record.get("id") or "未知文档").strip()
         abstract = str(paper_meta.get("abstract") or "").strip()
-        if not abstract and paper_doc:
-            abstract = self._truncate_text(paper_doc, 1000)
 
         header_lines = [
             "【文档级概述资料包】",
@@ -997,22 +996,93 @@ class BaseCollectionRetriever:
             return self.doc_metadatas[idx]
         return {}
 
-    def _where_clause_for_doc_hashes(self, allowed_doc_hashes: Optional[set[str]]) -> Optional[Dict[str, Any]]:
+    def _supports_structured_noise_filter(self) -> bool:
+        metadatas = [
+            meta for meta in self.doc_metadatas
+            if isinstance(meta, dict) and meta.get("level") != RetrievalLevel.PAPER.value
+        ]
+        return bool(metadatas) and all("is_noise_section" in meta for meta in metadatas)
+
+    def _non_noise_section_ids(self) -> List[str]:
+        section_ids = {
+            str(meta.get("section_id") or "").strip()
+            for meta in self.doc_metadatas
+            if isinstance(meta, dict)
+            and meta.get("level") != RetrievalLevel.PAPER.value
+            and not is_noise_section_metadata(meta)
+        }
+        return sorted(section_id for section_id in section_ids if section_id)
+
+    def _where_clause_for_doc_hashes(
+        self,
+        allowed_doc_hashes: Optional[set[str]],
+        exclude_noise_sections: bool = True,
+    ) -> Optional[Dict[str, Any]]:
+        clauses: List[Dict[str, Any]] = []
         if not allowed_doc_hashes:
+            normalized_hashes = []
+        else:
+            normalized_hashes = sorted({
+                str(doc_hash).strip().lower()
+                for doc_hash in allowed_doc_hashes
+                if isinstance(doc_hash, str) and str(doc_hash).strip()
+            })
+        if normalized_hashes:
+            clauses.append({"doc_hash": {"$in": normalized_hashes}})
+        if exclude_noise_sections:
+            section_ids = self._non_noise_section_ids()
+            if section_ids:
+                clauses.append({"section_id": {"$in": section_ids}})
+            elif self._supports_structured_noise_filter():
+                clauses.append({"is_noise_section": False})
+        if not clauses:
             return None
-        normalized_hashes = sorted({
-            str(doc_hash).strip().lower()
-            for doc_hash in allowed_doc_hashes
-            if isinstance(doc_hash, str) and str(doc_hash).strip()
-        })
-        if not normalized_hashes:
-            return None
-        return {"doc_hash": {"$in": normalized_hashes}}
+        if len(clauses) == 1:
+            return clauses[0]
+        return {"$and": clauses}
+
+    @staticmethod
+    def _bm25_cache_signature(doc_ids: List[str], doc_texts: List[str]) -> str:
+        digest = hashlib.sha256()
+        for doc_id, text in zip(doc_ids, doc_texts):
+            digest.update(str(doc_id).encode("utf-8", errors="ignore"))
+            digest.update(b"\0")
+            digest.update(str(text).encode("utf-8", errors="ignore"))
+            digest.update(b"\0")
+        return digest.hexdigest()
+
+    @staticmethod
+    def _extract_collection_documents(results: Dict[str, Any]) -> Tuple[List[str], List[str], List[Dict[str, Any]]]:
+        raw_ids = results.get("ids") or []
+        raw_docs = results.get("documents") or []
+        raw_metas = results.get("metadatas") or []
+        doc_ids: List[str] = []
+        doc_texts: List[str] = []
+        doc_metadatas: List[Dict[str, Any]] = []
+        for index, document in enumerate(raw_docs):
+            if document is None:
+                continue
+            meta = raw_metas[index] if index < len(raw_metas) else {}
+            meta_dict = dict(meta) if isinstance(meta, dict) else {}
+            if is_noise_section_metadata(meta_dict):
+                continue
+            doc_ids.append(str(raw_ids[index]) if index < len(raw_ids) and raw_ids[index] is not None else str(index))
+            doc_texts.append(str(document))
+            doc_metadatas.append(meta_dict)
+        return doc_ids, doc_texts, doc_metadatas
 
     def _build_bm25_index(self):
         cache_path = None
         if self.persist_directory:
             cache_path = os.path.join(self.persist_directory, f"bm25_cache_{self.collection_label}.pkl")
+
+        try:
+            collection_results = self.collection.get()
+            self.doc_ids, self.doc_texts, self.doc_metadatas = self._extract_collection_documents(collection_results or {})
+            current_signature = self._bm25_cache_signature(self.doc_ids, self.doc_texts)
+        except Exception as e:
+            logger.warning(f"Failed to read {self.collection_label} collection for BM25 index: {e}")
+            return
 
         # 尝试从磁盘加载缓存
         if cache_path and os.path.exists(cache_path):
@@ -1021,8 +1091,11 @@ class BaseCollectionRetriever:
                     cache_data = pickle.load(f)
 
                 # 检查缓存有效性（通过文档总数对比）
-                current_count = self.collection.count()
-                if len(cache_data.get("doc_ids", [])) == current_count:
+                if (
+                    cache_data.get("cache_version") == BM25_CACHE_VERSION
+                    and cache_data.get("doc_signature") == current_signature
+                    and len(cache_data.get("doc_ids", [])) == len(self.doc_ids)
+                ):
                     self.bm25 = cache_data.get("bm25")
                     self.doc_ids = cache_data.get("doc_ids", [])
                     self.doc_texts = cache_data.get("doc_texts", [])
@@ -1031,19 +1104,13 @@ class BaseCollectionRetriever:
                         logger.info(f"Loaded BM25 index from cache for {self.collection_label}: {len(self.doc_ids)} documents")
                         return
                 else:
-                    logger.info(f"BM25 cache for {self.collection_label} is stale (count {len(cache_data.get('doc_ids', []))} != {current_count}), rebuilding...")
+                    logger.info(f"BM25 cache for {self.collection_label} is stale, rebuilding...")
             except Exception as e:
                 logger.warning(f"Failed to load BM25 cache for {self.collection_label}: {e}")
 
         # 重新构建索引
         try:
-            results = self.collection.get()
-            if results and results.get("documents"):
-                self.doc_ids = [str(item) for item in (results.get("ids") or []) if item is not None]
-                self.doc_texts = [str(item) for item in (results.get("documents") or []) if item is not None]
-                self.doc_metadatas = [
-                    dict(item) for item in (results.get("metadatas") or []) if isinstance(item, dict)
-                ]
+            if self.doc_texts:
                 tokenized = [self._tokenize(text) for text in self.doc_texts]
                 self.bm25 = BM25Okapi(tokenized)
                 logger.info(f"Built BM25 index for {self.collection_label} collection: {len(self.doc_texts)} documents")
@@ -1054,6 +1121,8 @@ class BaseCollectionRetriever:
                         os.makedirs(os.path.dirname(cache_path), exist_ok=True)
                         with open(cache_path, "wb") as f:
                             pickle.dump({
+                                "cache_version": BM25_CACHE_VERSION,
+                                "doc_signature": current_signature,
                                 "bm25": self.bm25,
                                 "doc_ids": self.doc_ids,
                                 "doc_texts": self.doc_texts,
@@ -1074,11 +1143,26 @@ class BaseCollectionRetriever:
         results: List[RetrievalResult] = []
         try:
             where_clause = self._where_clause_for_doc_hashes(allowed_doc_hashes)
-            query_results = self.collection.query(
-                query_embeddings=self.embedding_fn([query]),
-                n_results=topn,
-                where=where_clause,
-            )
+            query_embedding = self.embedding_fn([query])
+            try:
+                query_results = self.collection.query(
+                    query_embeddings=query_embedding,
+                    n_results=topn,
+                    where=where_clause,
+                )
+            except Exception as exc:
+                if where_clause and self._supports_structured_noise_filter():
+                    logger.warning(f"{self.collection_label.capitalize()} dense pre-filter failed, retry without noise pre-filter: {exc}")
+                    query_results = self.collection.query(
+                        query_embeddings=query_embedding,
+                        n_results=topn,
+                        where=self._where_clause_for_doc_hashes(
+                            allowed_doc_hashes,
+                            exclude_noise_sections=False,
+                        ),
+                    )
+                else:
+                    raise
             ids = (query_results.get("ids") or [[]])[0]
             docs = (query_results.get("documents") or [[]])[0]
             metas = (query_results.get("metadatas") or [[]])[0]
@@ -1132,6 +1216,10 @@ class BaseCollectionRetriever:
                 return results
 
             candidate_indices = list(range(len(self.doc_texts)))
+            candidate_indices = [
+                idx for idx in candidate_indices
+                if not is_noise_section_metadata(self._metadata_at(idx))
+            ]
             if allowed_doc_hashes:
                 normalized_hashes = {
                     str(doc_hash).strip().lower()

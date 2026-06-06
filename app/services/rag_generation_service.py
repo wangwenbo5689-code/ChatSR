@@ -1,5 +1,8 @@
 from threading import Thread
+import json
 import re
+import urllib.error
+import urllib.request
 
 from loguru import logger
 from transformers import TextIteratorStreamer
@@ -147,7 +150,7 @@ class RagGenerationService:
             history=history,
             history_summary=history_summary,
         ):
-            if not self.rag.use_ollama and chunk == "</s>":
+            if not self.rag.use_ollama and not getattr(self.rag, "use_api", False) and chunk == "</s>":
                 continue
             yield chunk
 
@@ -169,6 +172,9 @@ class RagGenerationService:
         if self.rag.use_ollama:
             yield from self._stream_ollama(safe_tokens, safe_ctx, safe_temp, history, history_summary)
             return
+        if getattr(self.rag, "use_api", False):
+            yield from self._stream_api(safe_tokens, safe_temp, history, history_summary)
+            return
         yield from self._stream_local(safe_tokens, safe_ctx, safe_temp, repetition_penalty, history, history_summary)
 
     def _stream_ollama(self, max_tokens: int, context_len: int, temperature: float, history, history_summary):
@@ -188,6 +194,132 @@ class RagGenerationService:
         except Exception as exc:
             logger.error(f"Ollama API error: {exc}")
             raise RuntimeError(f"Ollama API error: {exc}") from exc
+
+    @staticmethod
+    def _api_endpoint(base_url: str, protocol: str) -> str:
+        base = (base_url or "").rstrip("/")
+        if not base:
+            raise ValueError("API base URL is empty")
+        normalized = (protocol or "").strip().lower()
+        if normalized == "anthropic":
+            if base.endswith("/v1/messages"):
+                return base
+            return f"{base}/v1/messages"
+        if base.endswith("/chat/completions"):
+            return base
+        return f"{base}/chat/completions"
+
+    @staticmethod
+    def _openai_delta(event: dict) -> str:
+        choices = event.get("choices") or []
+        if not choices:
+            return ""
+        choice = choices[0] or {}
+        delta = choice.get("delta") or {}
+        if isinstance(delta, dict) and delta.get("content"):
+            return str(delta.get("content") or "")
+        message = choice.get("message") or {}
+        if isinstance(message, dict) and message.get("content"):
+            return str(message.get("content") or "")
+        return ""
+
+    @staticmethod
+    def _anthropic_delta(event: dict) -> str:
+        event_type = event.get("type")
+        if event_type == "content_block_delta":
+            delta = event.get("delta") or {}
+            return str(delta.get("text") or "")
+        if event_type == "content_block_start":
+            block = event.get("content_block") or {}
+            return str(block.get("text") or "")
+        return ""
+
+    @staticmethod
+    def _split_anthropic_messages(messages: list[dict]) -> tuple[str, list[dict]]:
+        system_parts: list[str] = []
+        chat_messages: list[dict] = []
+        for message in messages or []:
+            role = str(message.get("role") or "").strip().lower()
+            content = str(message.get("content") or "")
+            if not content:
+                continue
+            if role == "system":
+                system_parts.append(content)
+                continue
+            role = "assistant" if role == "assistant" else "user"
+            if chat_messages and chat_messages[-1]["role"] == role:
+                chat_messages[-1]["content"] += "\n\n" + content
+            else:
+                chat_messages.append({"role": role, "content": content})
+        return "\n\n".join(system_parts).strip(), chat_messages
+
+    def _build_api_request(self, max_tokens: int, temperature: float, history, history_summary):
+        messages = self.rag._get_chat_input(history=history, history_summary=history_summary)
+        protocol = getattr(self.rag, "api_protocol", "openai")
+        endpoint = self._api_endpoint(getattr(self.rag, "api_base_url", ""), protocol)
+        api_key = getattr(self.rag, "api_key", "")
+        model = getattr(self.rag, "api_model", "")
+        if protocol == "anthropic":
+            system_prompt, chat_messages = self._split_anthropic_messages(messages)
+            payload = {
+                "model": model,
+                "messages": chat_messages,
+                "max_tokens": max_tokens,
+                "temperature": temperature,
+                "stream": True,
+            }
+            if system_prompt:
+                payload["system"] = system_prompt
+            headers = {
+                "Content-Type": "application/json",
+                "x-api-key": api_key,
+                "Authorization": f"Bearer {api_key}",
+                "anthropic-version": getattr(self.rag, "api_version", "2023-06-01"),
+            }
+        else:
+            payload = {
+                "model": model,
+                "messages": messages,
+                "max_tokens": max_tokens,
+                "temperature": temperature,
+                "stream": True,
+            }
+            headers = {
+                "Content-Type": "application/json",
+                "Authorization": f"Bearer {api_key}",
+            }
+        data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+        return urllib.request.Request(endpoint, data=data, headers=headers, method="POST")
+
+    def _stream_api(self, max_tokens: int, temperature: float, history, history_summary):
+        protocol = getattr(self.rag, "api_protocol", "openai")
+        request = self._build_api_request(max_tokens, temperature, history, history_summary)
+        try:
+            with urllib.request.urlopen(request, timeout=getattr(self.rag, "api_timeout", 120)) as response:
+                for raw_line in response:
+                    line = raw_line.decode("utf-8", errors="replace").strip()
+                    if not line or not line.startswith("data:"):
+                        continue
+                    data = line[5:].strip()
+                    if data == "[DONE]":
+                        break
+                    try:
+                        event = json.loads(data)
+                    except json.JSONDecodeError:
+                        continue
+                    text = self._anthropic_delta(event) if protocol == "anthropic" else self._openai_delta(event)
+                    if text:
+                        yield text
+        except urllib.error.HTTPError as exc:
+            body = exc.read().decode("utf-8", errors="replace")[:1000]
+            logger.error(f"LLM API HTTP error {exc.code}: {body}")
+            raise RuntimeError(f"LLM API HTTP error {exc.code}: {body}") from exc
+        except urllib.error.URLError as exc:
+            logger.error(f"LLM API connection error: {exc.reason}")
+            raise RuntimeError(f"LLM API connection error: {exc.reason}") from exc
+        except Exception as exc:
+            logger.error(f"LLM API error: {exc}")
+            raise RuntimeError(f"LLM API error: {exc}") from exc
 
     def _stream_local(self, max_tokens: int, context_len: int, temperature: float, repetition_penalty: float, history, history_summary):
         streamer = TextIteratorStreamer(self.rag.tokenizer, timeout=60.0, skip_prompt=True, skip_special_tokens=True)
